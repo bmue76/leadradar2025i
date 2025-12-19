@@ -5,16 +5,19 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "dev": "prisma generate && next dev",
-    "build": "prisma generate && prisma db push --accept-data-loss && prisma db seed && next build",
+    "dev": "prisma generate && next dev --webpack",
+    "build": "prisma generate && next build --webpack",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "prisma db seed"
   },
   "prisma": {
     "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
   },
   "dependencies": {
-    "@prisma/client": "^5.22.0",
+    "@prisma/client": "5.22.0",
     "@types/ms": "^0.7.32",
     "@types/node": "20.8.3",
     "@types/react": "18.2.25",
@@ -32,6 +35,6 @@
     "typescript": "^5"
   },
   "devDependencies": {
-    "prisma": "^5.22.0"
+    "prisma": "5.22.0"
   }
 }
