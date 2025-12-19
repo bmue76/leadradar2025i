@@ -1,720 +1,724 @@
 // prisma/schema.prisma
 
-generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "postgresql"
-  url      = env("POSTGRES_URL")
-}
-
-// ASSUMPTIONS
-// - IDs are String/cuid() for portability (no pg extensions required).
-// - Constraints like durationDays in {30,365} are enforced in app-layer.
-// - Tenant-scope is ensured by tenantId fields + indexes on all tenant-owned entities.
-// - Soft-delete for leads: hard delete only via retention/operator.
-
-enum TenantStatus {
-  ACTIVE
-  SUSPENDED
-  DELETED
-}
-
-enum UserRole {
-  TENANT_OWNER
-  TENANT_ADMIN
-  SUPPORT_OPERATOR
-  PLATFORM_ADMIN
-}
-
-enum PackageStatus {
-  ACTIVE
-  INACTIVE
-}
-
-enum OrderStatus {
-  CREATED
-  PAID
-  CANCELED
-  REFUNDED
-}
-
-enum PaymentProvider {
-  STRIPE
-  MANUAL
-}
-
-enum PaymentStatus {
-  PENDING
-  SUCCEEDED
-  FAILED
-  REFUNDED
-}
-
-enum LicenseKeySource {
-  PROMO
-  PURCHASED
-}
-
-enum LicenseKeyStatus {
-  PENDING
-  ISSUED
-  ACTIVE
-  EXPIRED
-  REVOKED
-}
-
-enum DevicePlatform {
-  IOS
-  ANDROID
-}
-
-enum DeviceActivationStatus {
-  SUCCESS
-  FAILED
-}
-
-enum GroupStatus {
-  ACTIVE
-  ARCHIVED
-}
-
-enum FormTemplateKind {
-  SYSTEM
-  TENANT
-}
-
-enum FormStatus {
-  DRAFT
-  ACTIVE
-  ARCHIVED
-}
-
-enum FieldType {
-  TEXT
-  TEXTAREA
-  EMAIL
-  PHONE
-  NUMBER
-  SELECT
-  MULTISELECT
-  CHECKBOX
-  DATE
-  DATETIME
-  URL
-}
-
-enum LeadAttachmentType {
-  IMAGE
-  PDF
-  OTHER
-}
-
-enum ExportJobType {
-  CSV
-  XLSX
-}
-
-enum ExportJobStatus {
-  QUEUED
-  RUNNING
-  DONE
-  FAILED
-}
-
-enum AuditActorType {
-  USER
-  SUPPORT
-  SYSTEM
-}
-
-enum SupportAccessStatus {
-  REQUESTED
-  ACTIVE
-  EXPIRED
-  REVOKED
-}
-
-enum RetentionStatus {
-  PENDING
-  DUE
-  PROCESSING
-  DONE
-  FAILED
-  CANCELED
-}
-
-enum RetentionEntityType {
-  LEAD
-}
-
-// =========================
-// Core: Tenant / Users
-// =========================
-
-model Tenant {
-  id            String       @id @default(cuid())
-  slug          String       @unique
-  name          String
-  status        TenantStatus @default(ACTIVE)
-  retentionDays Int          @default(365)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  users                  User[]
-  orders                 Order[]
-  payments               Payment[]
-  licenseKeys            LicenseKey[]
-  devices                Device[]
-  deviceActivations      DeviceActivation[]
-  groups                 Group[]
-  formTemplates          FormTemplate[]
-  forms                  Form[]
-  formFields             FormField[]
-  leads                  Lead[]
-  leadAttachments        LeadAttachment[]
-  recipientLists         RecipientList[]
-  recipientListEntries   RecipientListEntry[]
-  exportJobs             ExportJob[]
-  auditEvents            AuditEvent[]
-  supportAccessSessions  SupportAccessSession[]
-  retentionMarkers       RetentionMarker[]
-
-  @@index([status])
-}
-
-model User {
-  id    String   @id @default(cuid())
-  email String   @unique
-  name  String?
-  role  UserRole @default(TENANT_OWNER)
-
-  tenantId String?
-  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  orders      Order[]
-  exportJobs  ExportJob[]  @relation("ExportJobRequestedBy")
-  auditEvents AuditEvent[] @relation("AuditActorUser")
-
-  supportRequested SupportAccessSession[] @relation("SupportRequestedBy")
-  supportApproved  SupportAccessSession[] @relation("SupportApprovedBy")
-  supportRevoked   SupportAccessSession[] @relation("SupportRevokedBy")
-
-  leadsSoftDeleted Lead[] @relation("LeadSoftDeletedBy")
-
-  formsCreated Form[] @relation("FormCreatedBy")
-
-  @@index([tenantId])
-  @@index([role])
-}
-
-// =========================
-// Monetization: Packages / Orders / Payments / License Keys
-// =========================
-
-model Package {
-  id           String        @id @default(cuid())
-  code         String        @unique
-  name         String
-  durationDays Int
-  priceCents   Int
-  currency     String        @default("CHF")
-  status       PackageStatus @default(ACTIVE)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  orders Order[]
-
-  @@index([status])
-}
-
-model Order {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
-
-  userId String?
-  user   User? @relation(fields: [userId], references: [id], onDelete: SetNull)
-
-  packageId String
-  package   Package @relation(fields: [packageId], references: [id], onDelete: Restrict)
-
-  status     OrderStatus @default(CREATED)
-  totalCents Int
-  currency   String      @default("CHF")
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  payments    Payment[]
-  licenseKeys LicenseKey[]
-
-  @@index([tenantId, status, createdAt])
-  @@index([packageId])
-  @@index([userId])
-}
-
-model Payment {
-  id String @id @default(cuid())
-
-  tenantId String?
-  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
-
-  orderId String
-  order   Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
-
-  provider    PaymentProvider
-  status      PaymentStatus @default(PENDING)
-  providerRef String?
-
-  amountCents Int
-  currency    String @default("CHF")
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([orderId])
-  @@index([provider, status])
-  @@index([tenantId, createdAt])
-}
-
-model LicenseKey {
-  id  String @id @default(cuid())
-  key String @unique
-
-  source LicenseKeySource
-  status LicenseKeyStatus @default(PENDING)
-
-  durationDays Int
-
-  tenantId String?
-  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
-
-  orderId String?
-  order   Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
-
-  deviceId String?
-  device   Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
-
-  issuedAt    DateTime?
-  redeemedAt  DateTime?
-  activatedAt DateTime?
-  expiresAt   DateTime?
-  revokedAt   DateTime?
-
-  notes String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  activations DeviceActivation[]
-
-  @@index([tenantId, status])
-  @@index([orderId])
-  @@index([deviceId])
-}
-
-// =========================
-// Devices + Activations
-// =========================
-
-model Device {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  platform   DevicePlatform
-  deviceUid  String
-  label      String?
-  osVersion  String?
-  appVersion String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  licenseKeys   LicenseKey[]
-  activations   DeviceActivation[]
-  leadsCaptured Lead[]
-
-  @@unique([tenantId, deviceUid])
-  @@index([tenantId, platform])
-}
-
-model DeviceActivation {
-  id String @id @default(cuid())
-
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  deviceId String
-  device   Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-
-  licenseKeyId String
-  licenseKey   LicenseKey @relation(fields: [licenseKeyId], references: [id], onDelete: Cascade)
-
-  status DeviceActivationStatus
-  reason String?
-
-  createdAt DateTime @default(now())
-
-  @@unique([deviceId, licenseKeyId])
-  @@index([tenantId, createdAt])
-  @@index([deviceId, createdAt])
-  @@index([licenseKeyId, createdAt])
-}
-
-// =========================
-// Groups (2017 concept stays)
-// =========================
-
-model Group {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  name        String
-  description String?
-  status      GroupStatus @default(ACTIVE)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  forms Form[]
-  leads Lead[]
-
-  @@unique([tenantId, name])
-  @@index([tenantId, status])
-}
-
-// =========================
-// Templates / Forms / Fields
-// =========================
-
-model FormTemplate {
-  id String @id @default(cuid())
-
-  kind      FormTemplateKind @default(TENANT)
-  systemKey String?          @unique
-
-  tenantId String?
-  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
-
-  name        String
-  description String?
-  slug        String?
+  generator client {
+    provider = "prisma-client-js"
+  }
+
+  datasource db {
+    provider = "postgresql"
+    url      = env("POSTGRES_URL")
+  }
+
+  // ASSUMPTIONS
+  // - IDs are String/cuid() for portability (no pg extensions required).
+  // - Constraints like durationDays in {30,365} are enforced in app-layer.
+  // - Tenant-scope is ensured by tenantId fields + indexes on all tenant-owned entities.
+  // - Soft-delete for leads: hard delete only via retention/operator.
+
+  enum TenantStatus {
+    ACTIVE
+    SUSPENDED
+    DELETED
+  }
+
+  enum UserRole {
+    TENANT_OWNER
+    TENANT_ADMIN
+    SUPPORT_OPERATOR
+    PLATFORM_ADMIN
+  }
+
+  enum PackageStatus {
+    ACTIVE
+    INACTIVE
+  }
+
+  enum OrderStatus {
+    CREATED
+    PAID
+    CANCELED
+    REFUNDED
+  }
+
+  enum PaymentProvider {
+    STRIPE
+    MANUAL
+  }
+
+  enum PaymentStatus {
+    PENDING
+    SUCCEEDED
+    FAILED
+    REFUNDED
+  }
+
+  enum LicenseKeySource {
+    PROMO
+    PURCHASED
+  }
+
+  enum LicenseKeyStatus {
+    PENDING
+    ISSUED
+    ACTIVE
+    EXPIRED
+    REVOKED
+  }
+
+  enum DevicePlatform {
+    IOS
+    ANDROID
+  }
+
+  enum DeviceActivationStatus {
+    SUCCESS
+    FAILED
+  }
+
+  enum GroupStatus {
+    ACTIVE
+    ARCHIVED
+  }
+
+  enum FormTemplateKind {
+    SYSTEM
+    TENANT
+  }
+
+  enum FormStatus {
+    DRAFT
+    ACTIVE
+    ARCHIVED
+  }
+
+  enum FieldType {
+    TEXT
+    TEXTAREA
+    EMAIL
+    PHONE
+    NUMBER
+    SELECT
+    MULTISELECT
+    CHECKBOX
+    DATE
+    DATETIME
+    URL
+  }
+
+  enum LeadAttachmentType {
+    IMAGE
+    PDF
+    OTHER
+  }
+
+  enum ExportJobType {
+    CSV
+    XLSX
+  }
+
+  enum ExportJobStatus {
+    QUEUED
+    RUNNING
+    DONE
+    FAILED
+  }
+
+  enum AuditActorType {
+    USER
+    SUPPORT
+    SYSTEM
+  }
+
+  enum SupportAccessStatus {
+    REQUESTED
+    ACTIVE
+    EXPIRED
+    REVOKED
+  }
+
+  enum RetentionStatus {
+    PENDING
+    DUE
+    PROCESSING
+    DONE
+    FAILED
+    CANCELED
+  }
+
+  enum RetentionEntityType {
+    LEAD
+  }
+
+  // =========================
+  // Core: Tenant / Users
+  // =========================
+
+  model Tenant {
+    id            String       @id @default(cuid())
+    slug          String       @unique
+    name          String
+    status        TenantStatus @default(ACTIVE)
+    retentionDays Int          @default(365)
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    users                  User[]
+    orders                 Order[]
+    payments               Payment[]
+    licenseKeys            LicenseKey[]
+    devices                Device[]
+    deviceActivations      DeviceActivation[]
+    groups                 Group[]
+    formTemplates          FormTemplate[]
+    forms                  Form[]
+    formFields             FormField[]
+    leads                  Lead[]
+    leadAttachments        LeadAttachment[]
+    recipientLists         RecipientList[]
+    recipientListEntries   RecipientListEntry[]
+    exportJobs             ExportJob[]
+    auditEvents            AuditEvent[]
+    supportAccessSessions  SupportAccessSession[]
+    retentionMarkers       RetentionMarker[]
+
+    @@index([status])
+  }
+
+  model User {
+    id    String   @id @default(cuid())
+    email String   @unique
+    name  String?
+    role  UserRole @default(TENANT_OWNER)
+
+    tenantId String?
+    tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    orders      Order[]
+    exportJobs  ExportJob[]  @relation("ExportJobRequestedBy")
+    auditEvents AuditEvent[] @relation("AuditActorUser")
+
+    supportRequested SupportAccessSession[] @relation("SupportRequestedBy")
+    supportApproved  SupportAccessSession[] @relation("SupportApprovedBy")
+    supportRevoked   SupportAccessSession[] @relation("SupportRevokedBy")
+
+    leadsSoftDeleted Lead[] @relation("LeadSoftDeletedBy")
+
+    formsCreated Form[] @relation("FormCreatedBy")
+
+    @@index([tenantId])
+    @@index([role])
+  }
+
+  // =========================
+  // Monetization: Packages / Orders / Payments / License Keys
+  // =========================
+
+  model Package {
+    id           String        @id @default(cuid())
+    code         String        @unique
+    name         String
+    durationDays Int
+    priceCents   Int
+    currency     String        @default("CHF")
+    status       PackageStatus @default(ACTIVE)
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    orders Order[]
+
+    @@index([status])
+  }
+
+  model Order {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+    userId String?
+    user   User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+    packageId String
+    package   Package @relation(fields: [packageId], references: [id], onDelete: Restrict)
+
+    status     OrderStatus @default(CREATED)
+    totalCents Int
+    currency   String      @default("CHF")
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    payments    Payment[]
+    licenseKeys LicenseKey[]
+
+    @@index([tenantId, status, createdAt])
+    @@index([packageId])
+    @@index([userId])
+  }
+
+  model Payment {
+    id String @id @default(cuid())
+
+    tenantId String?
+    tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+    orderId String
+    order   Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+    provider    PaymentProvider
+    status      PaymentStatus @default(PENDING)
+    providerRef String?
+
+    amountCents Int
+    currency    String @default("CHF")
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    @@index([orderId])
+    @@index([provider, status])
+    @@index([tenantId, createdAt])
+  }
+
+  model LicenseKey {
+    id  String @id @default(cuid())
+    key String @unique
+
+    source LicenseKeySource
+    status LicenseKeyStatus @default(PENDING)
+
+    durationDays Int
+
+    tenantId String?
+    tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+    orderId String?
+    order   Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+    deviceId String?
+    device   Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+    issuedAt    DateTime?
+    redeemedAt  DateTime?
+    activatedAt DateTime?
+    expiresAt   DateTime?
+    revokedAt   DateTime?
+
+    notes String?
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    activations DeviceActivation[]
+
+    @@index([tenantId, status])
+    @@index([orderId])
+    @@index([deviceId])
+  }
+
+  // =========================
+  // Devices + Activations
+  // =========================
+
+  model Device {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+    platform   DevicePlatform
+    deviceUid  String
+    label      String?
+    osVersion  String?
+    appVersion String?
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    licenseKeys   LicenseKey[]
+    activations   DeviceActivation[]
+    leadsCaptured Lead[]
+
+    @@unique([tenantId, deviceUid])
+    @@index([tenantId, platform])
+  }
+
+  model DeviceActivation {
+    id String @id @default(cuid())
+
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+    deviceId String
+    device   Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+    licenseKeyId String
+    licenseKey   LicenseKey @relation(fields: [licenseKeyId], references: [id], onDelete: Cascade)
+
+    status DeviceActivationStatus
+    reason String?
+
+    createdAt DateTime @default(now())
+
+    @@unique([deviceId, licenseKeyId])
+    @@index([tenantId, createdAt])
+    @@index([deviceId, createdAt])
+    @@index([licenseKeyId, createdAt])
+  }
+
+  // =========================
+  // Groups (2017 concept stays)
+  // =========================
+
+  model Group {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+    name        String
+    description String?
+    status      GroupStatus @default(ACTIVE)
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    forms Form[]
+    leads Lead[]
+
+    @@unique([tenantId, name])
+    @@index([tenantId, status])
+  }
+
+  // =========================
+  // Templates / Forms / Fields
+  // =========================
+
+  model FormTemplate {
+    id String @id @default(cuid())
+
+    kind      FormTemplateKind @default(TENANT)
+    systemKey String?          @unique
+
+    tenantId String?
+    tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+
+    name        String
+    description String?
+    slug        String?
 
-  definition Json
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  forms Form[]
-
-  @@index([kind])
-  @@index([tenantId, kind])
-  @@index([tenantId, updatedAt])
-}
+    definition Json
 
-model Form {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  name        String
-  description String?
-  status      FormStatus @default(DRAFT)
-
-  groupId String?
-  group   Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    forms Form[]
+
+    @@index([kind])
+    @@index([tenantId, kind])
+    @@index([tenantId, updatedAt])
+  }
 
-  templateId String?
-  template   FormTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  model Form {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+    name        String
+    description String?
+    status      FormStatus @default(DRAFT)
+
+    groupId String?
+    group   Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
+    templateId String?
+    template   FormTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+    config Json?
+    theme  Json?
 
-  config Json?
-  theme  Json?
-
-  createdByUserId String?
-  createdByUser   User? @relation("FormCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+    createdByUserId String?
+    createdByUser   User? @relation("FormCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-  fields  FormField[]
-  leads   Lead[]
-  exports ExportJob[]
+    fields  FormField[]
+    leads   Lead[]
+    exports ExportJob[]
 
-  @@index([tenantId, status, updatedAt])
-  @@index([tenantId, createdAt])
-  @@index([groupId])
-  @@index([templateId])
-  @@index([createdByUserId])
-}
+    @@index([tenantId, status, updatedAt])
+    @@index([tenantId, createdAt])
+    @@index([groupId])
+    @@index([templateId])
+    @@index([createdByUserId])
+  }
 
-model FormField {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  model FormField {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  formId String
-  form   Form @relation(fields: [formId], references: [id], onDelete: Cascade)
+    formId String
+    form   Form @relation(fields: [formId], references: [id], onDelete: Cascade)
 
-  key       String
-  label     String
-  type      FieldType
-  required  Boolean @default(false)
-  isActive  Boolean @default(true)
-  sortOrder Int     @default(0)
+    key       String
+    label     String
+    type      FieldType
+    required  Boolean @default(false)
+    isActive  Boolean @default(true)
+    sortOrder Int     @default(0)
 
-  placeholder String?
-  helpText    String?
+    placeholder String?
+    helpText    String?
 
-  config Json?
+    config Json?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-  @@unique([formId, key])
-  @@index([tenantId, formId, sortOrder])
-  @@index([tenantId, formId])
-}
+    @@unique([formId, key])
+    @@index([tenantId, formId, sortOrder])
+    @@index([tenantId, formId])
+  }
 
-// =========================
-// Leads / Attachments (soft delete)
-// =========================
+  // =========================
+  // Leads / Attachments (soft delete)
+  // =========================
 
-model Lead {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  model Lead {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  formId String
-  form   Form @relation(fields: [formId], references: [id], onDelete: Restrict)
+    formId String
+    form   Form @relation(fields: [formId], references: [id], onDelete: Restrict)
 
-  groupId String?
-  group   Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+    groupId String?
+    group   Group? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
-  capturedByDeviceId String?
-  capturedByDevice   Device? @relation(fields: [capturedByDeviceId], references: [id], onDelete: SetNull)
+    capturedByDeviceId String?
+    capturedByDevice   Device? @relation(fields: [capturedByDeviceId], references: [id], onDelete: SetNull)
 
-  values Json
-  meta   Json?
+    // Mobile idempotency key (Teilprojekt 1.5 ASSUMPTION: required)
+    clientLeadId String
 
-  capturedAt DateTime @default(now())
+    values Json
+    meta   Json?
 
-  isDeleted       Boolean   @default(false)
-  deletedAt       DateTime?
-  deletedReason   String?
-  deletedByUserId String?
-  deletedByUser   User? @relation("LeadSoftDeletedBy", fields: [deletedByUserId], references: [id], onDelete: SetNull)
+    capturedAt DateTime @default(now())
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+    isDeleted       Boolean   @default(false)
+    deletedAt       DateTime?
+    deletedReason   String?
+    deletedByUserId String?
+    deletedByUser   User? @relation("LeadSoftDeletedBy", fields: [deletedByUserId], references: [id], onDelete: SetNull)
 
-  attachments LeadAttachment[]
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-  @@index([tenantId, formId, capturedAt])
-  @@index([tenantId, isDeleted, capturedAt])
-  @@index([capturedByDeviceId, capturedAt])
-  @@index([groupId])
-}
+    attachments LeadAttachment[]
 
-model LeadAttachment {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+    @@unique([tenantId, clientLeadId])
+    @@index([tenantId, formId, capturedAt])
+    @@index([tenantId, isDeleted, capturedAt])
+    @@index([capturedByDeviceId, capturedAt])
+    @@index([groupId])
+  }
 
-  leadId String
-  lead   Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  model LeadAttachment {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  type LeadAttachmentType @default(OTHER)
+    leadId String
+    lead   Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
 
-  filename  String?
-  mimeType  String?
-  sizeBytes Int?
-  checksum  String?
+    type LeadAttachmentType @default(OTHER)
 
-  storageKey String?
-  url        String?
+    filename  String?
+    mimeType  String?
+    sizeBytes Int?
+    checksum  String?
 
-  createdAt DateTime @default(now())
+    storageKey String?
+    url        String?
 
-  @@index([tenantId, createdAt])
-  @@index([leadId])
-}
+    createdAt DateTime @default(now())
 
-// =========================
-// Recipient lists / Export jobs
-// =========================
+    @@index([tenantId, createdAt])
+    @@index([leadId])
+  }
 
-model RecipientList {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // =========================
+  // Recipient lists / Export jobs
+  // =========================
 
-  name        String
-  description String?
-  isActive    Boolean @default(true)
+  model RecipientList {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+    name        String
+    description String?
+    isActive    Boolean @default(true)
 
-  entries RecipientListEntry[]
-  exports ExportJob[]
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-  @@unique([tenantId, name])
-  @@index([tenantId, isActive])
-}
+    entries RecipientListEntry[]
+    exports ExportJob[]
 
-model RecipientListEntry {
-  id String @id @default(cuid())
+    @@unique([tenantId, name])
+    @@index([tenantId, isActive])
+  }
 
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  model RecipientListEntry {
+    id String @id @default(cuid())
 
-  recipientListId String
-  recipientList   RecipientList @relation(fields: [recipientListId], references: [id], onDelete: Cascade)
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  email String
-  name  String?
+    recipientListId String
+    recipientList   RecipientList @relation(fields: [recipientListId], references: [id], onDelete: Cascade)
 
-  createdAt DateTime @default(now())
+    email String
+    name  String?
 
-  @@unique([recipientListId, email])
-  @@index([tenantId, createdAt])
-  @@index([recipientListId, createdAt])
-}
+    createdAt DateTime @default(now())
 
-model ExportJob {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+    @@unique([recipientListId, email])
+    @@index([tenantId, createdAt])
+    @@index([recipientListId, createdAt])
+  }
 
-  type   ExportJobType
-  status ExportJobStatus @default(QUEUED)
+  model ExportJob {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  formId String?
-  form   Form? @relation(fields: [formId], references: [id], onDelete: SetNull)
+    type   ExportJobType
+    status ExportJobStatus @default(QUEUED)
 
-  recipientListId String?
-  recipientList   RecipientList? @relation(fields: [recipientListId], references: [id], onDelete: SetNull)
+    formId String?
+    form   Form? @relation(fields: [formId], references: [id], onDelete: SetNull)
 
-  requestedByUserId String?
-  requestedByUser   User? @relation("ExportJobRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+    recipientListId String?
+    recipientList   RecipientList? @relation(fields: [recipientListId], references: [id], onDelete: SetNull)
 
-  params Json?
+    requestedByUserId String?
+    requestedByUser   User? @relation("ExportJobRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
 
-  resultStorageKey String?
-  resultUrl        String?
-  error            String?
+    params Json?
 
-  queuedAt   DateTime @default(now())
-  startedAt  DateTime?
-  finishedAt DateTime?
+    resultStorageKey String?
+    resultUrl        String?
+    error            String?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+    queuedAt   DateTime @default(now())
+    startedAt  DateTime?
+    finishedAt DateTime?
 
-  @@index([tenantId, status, createdAt])
-  @@index([tenantId, type, createdAt])
-  @@index([formId, createdAt])
-  @@index([recipientListId])
-  @@index([requestedByUserId, createdAt])
-}
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-// =========================
-// Audit / Break-glass support
-// =========================
+    @@index([tenantId, status, createdAt])
+    @@index([tenantId, type, createdAt])
+    @@index([formId, createdAt])
+    @@index([recipientListId])
+    @@index([requestedByUserId, createdAt])
+  }
 
-model AuditEvent {
-  id String @id @default(cuid())
+  // =========================
+  // Audit / Break-glass support
+  // =========================
 
-  tenantId String?
-  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  model AuditEvent {
+    id String @id @default(cuid())
 
-  actorType   AuditActorType
-  actorUserId String?
-  actorUser   User? @relation("AuditActorUser", fields: [actorUserId], references: [id], onDelete: SetNull)
+    tenantId String?
+    tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
 
-  action String
+    actorType   AuditActorType
+    actorUserId String?
+    actorUser   User? @relation("AuditActorUser", fields: [actorUserId], references: [id], onDelete: SetNull)
 
-  entityType String?
-  entityId   String?
+    action String
 
-  ip        String?
-  userAgent String?
+    entityType String?
+    entityId   String?
 
-  meta Json?
+    ip        String?
+    userAgent String?
 
-  createdAt DateTime @default(now())
+    meta Json?
 
-  @@index([tenantId, createdAt])
-  @@index([actorType, createdAt])
-  @@index([actorUserId, createdAt])
-  @@index([action, createdAt])
-}
+    createdAt DateTime @default(now())
 
-model SupportAccessSession {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+    @@index([tenantId, createdAt])
+    @@index([actorType, createdAt])
+    @@index([actorUserId, createdAt])
+    @@index([action, createdAt])
+  }
 
-  status SupportAccessStatus @default(REQUESTED)
+  model SupportAccessSession {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  requestedByUserId String
-  requestedByUser   User @relation("SupportRequestedBy", fields: [requestedByUserId], references: [id], onDelete: Restrict)
+    status SupportAccessStatus @default(REQUESTED)
 
-  approvedByUserId String?
-  approvedByUser   User? @relation("SupportApprovedBy", fields: [approvedByUserId], references: [id], onDelete: SetNull)
-  approvedAt       DateTime?
+    requestedByUserId String
+    requestedByUser   User @relation("SupportRequestedBy", fields: [requestedByUserId], references: [id], onDelete: Restrict)
 
-  expiresAt   DateTime
-  activatedAt DateTime?
+    approvedByUserId String?
+    approvedByUser   User? @relation("SupportApprovedBy", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+    approvedAt       DateTime?
 
-  revokedAt       DateTime?
-  revokedByUserId String?
-  revokedByUser   User? @relation("SupportRevokedBy", fields: [revokedByUserId], references: [id], onDelete: SetNull)
+    expiresAt   DateTime
+    activatedAt DateTime?
 
-  reason String
-  meta   Json?
+    revokedAt       DateTime?
+    revokedByUserId String?
+    revokedByUser   User? @relation("SupportRevokedBy", fields: [revokedByUserId], references: [id], onDelete: SetNull)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+    reason String
+    meta   Json?
 
-  @@index([tenantId, status, expiresAt])
-  @@index([requestedByUserId, createdAt])
-  @@index([approvedByUserId, approvedAt])
-}
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
 
-// =========================
-// Retention marker (DELETION_DUE)
-// =========================
+    @@index([tenantId, status, expiresAt])
+    @@index([requestedByUserId, createdAt])
+    @@index([approvedByUserId, approvedAt])
+  }
 
-model RetentionMarker {
-  id       String @id @default(cuid())
-  tenantId String
-  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // =========================
+  // Retention marker (DELETION_DUE)
+  // =========================
 
-  entityType RetentionEntityType
-  entityId   String
+  model RetentionMarker {
+    id       String @id @default(cuid())
+    tenantId String
+    tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  status RetentionStatus @default(PENDING)
+    entityType RetentionEntityType
+    entityId   String
 
-  dueAt DateTime
+    status RetentionStatus @default(PENDING)
 
-  startedAt  DateTime?
-  finishedAt DateTime?
-  error      String?
+    dueAt DateTime
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+    startedAt  DateTime?
+    finishedAt DateTime?
+    error      String?
 
-  @@unique([entityType, entityId])
-  @@index([tenantId, status, dueAt])
-  @@index([tenantId, dueAt])
-}
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    @@unique([entityType, entityId])
+    @@index([tenantId, status, dueAt])
+    @@index([tenantId, dueAt])
+  }
