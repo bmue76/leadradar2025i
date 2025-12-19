@@ -37,3 +37,9 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+
+# LeadRadar local tmp artifacts (dev)
+.tmp_*.json
+.tmp_*.csv
+.tmp_*.txt
+.tmp_exports/
