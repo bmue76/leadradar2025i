@@ -2,156 +2,245 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
-import * as AdminFetchModule from "../../_lib/adminFetch";
+import { useParams } from "next/navigation";
+import { adminFetch } from "../../_lib/adminFetch";
 
-type LeadAttachmentLite = {
-  id?: string;
-  filename?: string | null;
-  contentType?: string | null;
-  createdAt?: string | null;
-};
-
-type LeadDetail = {
+type Lead = {
   id: string;
-  formId?: string | null;
+  formId: string;
   capturedAt?: string | null;
-  createdAt?: string | null;
-  updatedAt?: string | null;
-
+  values?: any;
+  meta?: any;
   deletedAt?: string | null;
-  deletedReason?: string | null;
-
-  values?: unknown;
-  meta?: unknown;
-
-  attachments?: LeadAttachmentLite[] | null;
-
-  // optional fields that may exist (we display safely if present)
-  clientLeadId?: string | null;
 };
 
-function safeStringify(value: unknown) {
+type RecipientList = {
+  id: string;
+  name: string;
+  description?: string | null;
+  active?: boolean | null;
+};
+
+type ApiOk<T> = { ok: true; status: number; data: T; raw: unknown };
+type ApiFail = { ok: false; status: number; error: any; raw: unknown };
+
+function unwrapApi<T = any>(res: any): T {
+  if (res && typeof res === "object" && "ok" in res) {
+    const r = res as ApiOk<T> | ApiFail;
+    if (r.ok) return (r as ApiOk<T>).data;
+    const msg =
+      (r as ApiFail)?.error?.message ??
+      (r as ApiFail)?.error?.error?.message ??
+      "Request failed";
+    throw new Error(msg);
+  }
+  return res as T;
+}
+
+function pickLead(payload: any): Lead | null {
+  return payload?.lead ?? payload ?? null;
+}
+
+function pickRecipients(payload: any): RecipientList[] {
+  const candidates = payload?.recipients ?? payload?.items ?? payload ?? [];
+  return Array.isArray(candidates) ? candidates : [];
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return "—";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString();
+}
+
+function safeStringify(obj: any) {
   try {
-    return JSON.stringify(value ?? {}, null, 2);
+    return JSON.stringify(obj ?? {}, null, 2);
   } catch {
-    return "{\n  \n}";
+    return "{}";
   }
 }
 
-function tryParseJson(text: string): { ok: true; value: any } | { ok: false; error: string } {
+function parseJsonStrict(text: string) {
+  return JSON.parse(text);
+}
+
+function getDevUserId(): string | null {
   try {
-    const v = JSON.parse(text);
-    return { ok: true, value: v };
-  } catch (e: any) {
-    return { ok: false, error: e?.message ?? "Invalid JSON" };
+    return localStorage.getItem("x-user-id");
+  } catch {
+    return null;
   }
 }
 
-function pickLead(resp: any): LeadDetail | null {
-  const data = resp?.data ?? resp;
-  if (!data) return null;
-  // some APIs return { ok:true, data:{ lead: {...} } }
-  if (data?.lead && typeof data.lead === "object") return data.lead as LeadDetail;
-  if (typeof data === "object") return data as LeadDetail;
-  return null;
+async function postMobileForward(args: {
+  leadId: string;
+  tenantSlug: string;
+  recipientListId: string;
+  subject?: string;
+  message?: string;
+}) {
+  const userId = getDevUserId();
+  // Mobile endpoint braucht in DEV evtl. auch x-user-id (je nach Guard). Wir senden ihn mit, falls vorhanden.
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "x-tenant-slug": args.tenantSlug,
+  };
+  if (userId) headers["x-user-id"] = userId;
+
+  const res = await fetch(`/api/mobile/v1/leads/${args.leadId}/forward`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      recipientListId: args.recipientListId,
+      subject: args.subject?.trim() ? args.subject.trim() : undefined,
+      message: args.message?.trim() ? args.message.trim() : undefined,
+    }),
+  });
+
+  const ct = res.headers.get("content-type") || "";
+  const isJson = ct.includes("application/json");
+
+  if (!res.ok) {
+    let msg = `Forward failed (${res.status})`;
+    try {
+      if (isJson) {
+        const j = await res.json();
+        msg = j?.error?.message ?? j?.message ?? msg;
+      } else {
+        const t = await res.text();
+        if (t?.trim()) msg = t.trim();
+      }
+    } catch {
+      // ignore
+    }
+    throw new Error(msg);
+  }
+
+  if (isJson) return res.json();
+  return { ok: true };
 }
 
 export default function AdminLeadDetailPage() {
-  const adminFetch: any =
-    (AdminFetchModule as any).adminFetch ?? (AdminFetchModule as any).default;
+  const params = useParams<{ id: string }>();
+  const leadId = params?.id;
 
-  const canFetch = useMemo(() => typeof adminFetch === "function", [adminFetch]);
-
-  const params = useParams();
-  const router = useRouter();
-
-  const rawId = (params as any)?.id;
-  const leadId = Array.isArray(rawId) ? rawId[0] : rawId;
-
-  const [lead, setLead] = useState<LeadDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-
   const [error, setError] = useState<string | null>(null);
 
-  const [valuesText, setValuesText] = useState<string>("");
-  const [metaText, setMetaText] = useState<string>("");
+  const [lead, setLead] = useState<Lead | null>(null);
 
-  const [valuesError, setValuesError] = useState<string | null>(null);
-  const [metaError, setMetaError] = useState<string | null>(null);
+  // Editor fields
+  const [valuesText, setValuesText] = useState<string>("{}");
+  const [metaText, setMetaText] = useState<string>("{}");
 
-  const [deleteReason, setDeleteReason] = useState<string>("");
+  // Forward UI state
+  const [tenantSlug, setTenantSlug] = useState<string>("");
+  const [recipients, setRecipients] = useState<RecipientList[]>([]);
+  const [recipientListId, setRecipientListId] = useState<string>("");
+  const [subject, setSubject] = useState<string>("");
+  const [message, setMessage] = useState<string>("");
 
-  async function reload() {
-    if (!canFetch) {
-      setLoading(false);
-      setError("adminFetch() nicht gefunden. Prüfe Importpfad: app/(admin)/admin/_lib/adminFetch.ts");
-      return;
-    }
-    if (!leadId) {
-      setLoading(false);
-      setError("Keine Lead-ID in Route gefunden.");
-      return;
-    }
+  const [forwarding, setForwarding] = useState(false);
+  const [forwardResult, setForwardResult] = useState<any>(null);
 
-    setLoading(true);
+  const canSave = useMemo(() => {
+    return !!leadId && !!lead && !saving;
+  }, [leadId, lead, saving]);
+
+  const canForward = useMemo(() => {
+    return (
+      !!leadId &&
+      !forwarding &&
+      tenantSlug.trim().length > 0 &&
+      recipientListId.trim().length > 0
+    );
+  }, [leadId, forwarding, tenantSlug, recipientListId]);
+
+  async function loadLead() {
+    if (!leadId) return;
+
     setError(null);
-
+    setLoading(true);
     try {
-      const resp = await adminFetch(`/api/admin/v1/leads/${encodeURIComponent(leadId)}`, {
-        cache: "no-store",
-      });
-      const l = pickLead(resp);
-      if (!l) throw new Error("Lead-Response leer oder unerwartetes Format.");
+      const res = await adminFetch<any>(`/api/admin/v1/leads/${leadId}`, { method: "GET" });
+      const data = unwrapApi<any>(res);
+      const l = pickLead(data);
 
       setLead(l);
-      setValuesText(safeStringify(l.values));
-      setMetaText(safeStringify(l.meta));
-      setValuesError(null);
-      setMetaError(null);
+      setValuesText(safeStringify(l?.values));
+      setMetaText(safeStringify(l?.meta));
     } catch (e: any) {
-      setError(e?.message ?? "Unbekannter Fehler beim Laden");
+      setError(e?.message ?? "Failed to load lead.");
       setLead(null);
+      setValuesText("{}");
+      setMetaText("{}");
     } finally {
       setLoading(false);
     }
   }
 
-  useEffect(() => {
-    reload();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leadId, canFetch]);
-
-  async function onSave() {
-    if (!leadId) return;
-
-    const pv = tryParseJson(valuesText);
-    const pm = tryParseJson(metaText);
-
-    setValuesError(pv.ok ? null : pv.error);
-    setMetaError(pm.ok ? null : pm.error);
-
-    if (!pv.ok || !pm.ok) return;
-
-    setSaving(true);
+  async function loadRecipients() {
     setError(null);
     try {
-      await adminFetch(`/api/admin/v1/leads/${encodeURIComponent(leadId)}`, {
+      const res = await adminFetch<any>("/api/admin/v1/recipients", { method: "GET" });
+      const data = unwrapApi<any>(res);
+      const lists = pickRecipients(data).filter((r) => (r.active ?? true) === true);
+
+      setRecipients(lists);
+      if (!recipientListId && lists.length > 0) {
+        setRecipientListId(lists[0].id);
+      }
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to load recipient lists.");
+      setRecipients([]);
+    }
+  }
+
+  async function loadTenantSlug() {
+    setError(null);
+    try {
+      const res = await adminFetch<any>("/api/admin/v1/whoami", { method: "GET" });
+      const data = unwrapApi<any>(res);
+
+      const slug =
+        data?.tenant?.slug ??
+        data?.tenantSlug ??
+        data?.tenant?.data?.slug ??
+        "";
+
+      if (typeof slug === "string" && slug.trim()) {
+        setTenantSlug(slug.trim());
+      }
+    } catch {
+      // ignore: user can input slug manually
+    }
+  }
+
+  async function onSave() {
+    if (!leadId || !canSave) return;
+
+    setError(null);
+    setSaving(true);
+    try {
+      const values = parseJsonStrict(valuesText);
+      const meta = parseJsonStrict(metaText);
+
+      const res = await adminFetch<any>(`/api/admin/v1/leads/${leadId}`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          values: pv.value,
-          meta: pm.value,
-        }),
-        cache: "no-store",
+        body: JSON.stringify({ values, meta }),
       });
 
-      await reload();
-      router.refresh();
+      const data = unwrapApi<any>(res);
+      const updated = pickLead(data) ?? lead;
+
+      setLead(updated);
+      setValuesText(safeStringify(updated?.values ?? values));
+      setMetaText(safeStringify(updated?.meta ?? meta));
     } catch (e: any) {
-      setError(e?.message ?? "Unbekannter Fehler beim Speichern");
+      setError(e?.message ?? "Failed to save lead.");
     } finally {
       setSaving(false);
     }
@@ -159,230 +248,260 @@ export default function AdminLeadDetailPage() {
 
   async function onDelete() {
     if (!leadId) return;
-    if (lead?.deletedAt) return;
-
-    const ok = window.confirm("Lead wirklich soft-deleten?");
+    const ok = window.confirm("Lead wirklich soft-delete?");
     if (!ok) return;
 
-    setDeleting(true);
     setError(null);
+    setSaving(true);
     try {
-      const body =
-        deleteReason.trim().length > 0 ? JSON.stringify({ reason: deleteReason.trim() }) : undefined;
-
-      await adminFetch(`/api/admin/v1/leads/${encodeURIComponent(leadId)}`, {
-        method: "DELETE",
-        headers: body ? { "content-type": "application/json" } : undefined,
-        body,
-        cache: "no-store",
-      });
-
-      await reload();
-      router.refresh();
+      const res = await adminFetch<any>(`/api/admin/v1/leads/${leadId}`, { method: "DELETE" });
+      // some endpoints return body; unwrap anyway
+      unwrapApi<any>(res);
+      await loadLead();
     } catch (e: any) {
-      setError(e?.message ?? "Unbekannter Fehler beim Löschen");
+      setError(e?.message ?? "Failed to delete lead.");
     } finally {
-      setDeleting(false);
+      setSaving(false);
     }
   }
 
-  const capturedAt = lead?.capturedAt ?? lead?.createdAt ?? null;
+  async function onForward() {
+    if (!leadId || !canForward) return;
+
+    setError(null);
+    setForwardResult(null);
+    setForwarding(true);
+    try {
+      const res = await postMobileForward({
+        leadId,
+        tenantSlug: tenantSlug.trim(),
+        recipientListId: recipientListId.trim(),
+        subject,
+        message,
+      });
+      setForwardResult(res);
+    } catch (e: any) {
+      setError(e?.message ?? "Forward failed.");
+    } finally {
+      setForwarding(false);
+    }
+  }
+
+  useEffect(() => {
+    loadLead();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leadId]);
+
+  useEffect(() => {
+    loadRecipients();
+    loadTenantSlug();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const deleted = !!lead?.deletedAt;
 
   return (
-    <div className="flex flex-col gap-6">
-      <header className="flex items-start justify-between gap-4">
-        <div className="flex flex-col gap-1">
-          <div className="text-sm text-slate-600">
-            <Link className="underline underline-offset-2" href="/admin/leads">
-              ← zurück zur Liste
-            </Link>
+    <div className="p-6">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <Link href="/admin/leads" className="text-sm text-neutral-600 hover:text-neutral-900">
+            ← Leads
+          </Link>
+
+          <h1 className="mt-2 text-xl font-semibold">Lead Detail</h1>
+
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-neutral-600">
+            <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-xs text-neutral-700">
+              id: {leadId ?? "—"}
+            </span>
+
+            <span
+              className={[
+                "inline-flex items-center rounded-full px-2 py-0.5 text-xs",
+                deleted ? "bg-red-50 text-red-700" : "bg-emerald-50 text-emerald-700",
+              ].join(" ")}
+            >
+              {deleted ? "deleted" : "active"}
+            </span>
           </div>
-
-          <h1 className="text-2xl font-semibold tracking-tight">Lead Detail</h1>
-
-          <div className="flex flex-wrap items-center gap-2 text-sm text-slate-600">
-            <span className="font-mono text-slate-900">{leadId ?? "—"}</span>
-            {lead?.formId ? (
-              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700">
-                formId: <span className="font-mono">{lead.formId}</span>
-              </span>
-            ) : null}
-            {capturedAt ? (
-              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-700">
-                capturedAt: {new Date(capturedAt).toLocaleString()}
-              </span>
-            ) : null}
-
-            {lead?.deletedAt ? (
-              <span className="rounded-full bg-red-50 px-2 py-0.5 text-xs font-medium text-red-700">
-                deleted
-              </span>
-            ) : (
-              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                active
-              </span>
-            )}
-          </div>
-
-          {lead?.deletedAt ? (
-            <div className="text-xs text-slate-500">
-              deletedAt: {new Date(lead.deletedAt).toLocaleString()}
-              {lead.deletedReason ? ` • reason: ${lead.deletedReason}` : ""}
-            </div>
-          ) : null}
         </div>
 
         <div className="flex items-center gap-2">
           <button
-            className="rounded-md border border-slate-200 px-3 py-2 text-sm hover:bg-slate-50 disabled:opacity-50"
-            onClick={reload}
-            disabled={loading || saving || deleting}
+            onClick={loadLead}
+            className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50 disabled:opacity-50"
+            disabled={loading || saving || forwarding}
           >
             Refresh
           </button>
           <button
-            className="rounded-md bg-slate-900 px-3 py-2 text-sm text-white disabled:opacity-50"
-            onClick={onSave}
-            disabled={loading || saving || deleting}
+            onClick={onDelete}
+            className="rounded-md border px-3 py-2 text-sm hover:bg-neutral-50 disabled:opacity-50"
+            disabled={loading || saving || forwarding}
           >
-            {saving ? "Speichern…" : "Save"}
+            Soft-delete
           </button>
         </div>
-      </header>
+      </div>
 
-      {error ? <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div> : null}
+      {error ? (
+        <div className="mt-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+          {error}
+        </div>
+      ) : null}
 
-      {loading ? (
-        <div className="text-sm text-slate-600">Loading lead…</div>
-      ) : !lead ? (
-        <div className="text-sm text-slate-600">Lead nicht gefunden.</div>
-      ) : (
-        <>
-          {/* Values */}
-          <section className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <div className="text-sm font-medium">1) Values (JSON)</div>
-              {valuesError ? (
-                <div className="text-xs text-red-700">JSON Fehler: {valuesError}</div>
+      {/* Summary */}
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
+        <div className="rounded-lg border bg-white p-4">
+          <div className="text-xs text-neutral-500">Captured</div>
+          <div className="mt-1 text-sm font-medium">{formatDateTime(lead?.capturedAt ?? null)}</div>
+        </div>
+        <div className="rounded-lg border bg-white p-4">
+          <div className="text-xs text-neutral-500">Form</div>
+          <div className="mt-1 text-sm font-medium">{lead?.formId ?? "—"}</div>
+        </div>
+        <div className="rounded-lg border bg-white p-4">
+          <div className="text-xs text-neutral-500">Deleted At</div>
+          <div className="mt-1 text-sm font-medium">{formatDateTime(lead?.deletedAt ?? null)}</div>
+        </div>
+      </div>
+
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
+        {/* Values */}
+        <div className="rounded-lg border bg-white p-4">
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-sm font-semibold">Values (JSON)</h2>
+            <button
+              onClick={onSave}
+              disabled={!canSave}
+              className="rounded-md bg-neutral-900 px-3 py-2 text-sm text-white hover:bg-neutral-800 disabled:opacity-50"
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+
+          <textarea
+            className="mt-3 h-80 w-full rounded-md border px-3 py-2 font-mono text-xs outline-none focus:ring-2 focus:ring-neutral-200"
+            value={valuesText}
+            onChange={(e) => setValuesText(e.target.value)}
+            spellCheck={false}
+            disabled={loading || saving}
+          />
+          <p className="mt-2 text-xs text-neutral-500">Hinweis: JSON muss valide sein.</p>
+        </div>
+
+        {/* Meta */}
+        <div className="rounded-lg border bg-white p-4">
+          <h2 className="text-sm font-semibold">Meta (JSON)</h2>
+
+          <textarea
+            className="mt-3 h-80 w-full rounded-md border px-3 py-2 font-mono text-xs outline-none focus:ring-2 focus:ring-neutral-200"
+            value={metaText}
+            onChange={(e) => setMetaText(e.target.value)}
+            spellCheck={false}
+            disabled={loading || saving}
+          />
+
+          <div className="mt-2 text-xs text-neutral-500">
+            Save-Button ist bei Values-Card (speichert Values + Meta zusammen).
+          </div>
+        </div>
+      </div>
+
+      {/* Forward UI */}
+      <div className="mt-6 rounded-lg border bg-white p-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-sm font-semibold">Forward (Stub)</h2>
+            <p className="mt-1 text-sm text-neutral-600">
+              Ruft <span className="font-mono text-xs">/api/mobile/v1/leads/{leadId}/forward</span>{" "}
+              mit <span className="font-mono text-xs">x-tenant-slug</span> auf.
+            </p>
+          </div>
+
+          <button
+            onClick={onForward}
+            disabled={!canForward}
+            className="rounded-md bg-neutral-900 px-3 py-2 text-sm text-white hover:bg-neutral-800 disabled:opacity-50"
+          >
+            {forwarding ? "Forwarding…" : "Forward"}
+          </button>
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="rounded-md border p-3">
+            <label className="block text-xs font-medium text-neutral-700">Tenant Slug *</label>
+            <input
+              className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+              value={tenantSlug}
+              onChange={(e) => setTenantSlug(e.target.value)}
+              placeholder="z.B. acme-messe-2026"
+              disabled={forwarding}
+            />
+            <p className="mt-2 text-xs text-neutral-500">
+              Wird versucht via <span className="font-mono">/api/admin/v1/whoami</span> zu laden.
+              Falls leer: hier manuell setzen.
+            </p>
+          </div>
+
+          <div className="rounded-md border p-3">
+            <label className="block text-xs font-medium text-neutral-700">Recipient List *</label>
+            <select
+              className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+              value={recipientListId}
+              onChange={(e) => setRecipientListId(e.target.value)}
+              disabled={forwarding || recipients.length === 0}
+            >
+              {recipients.length === 0 ? (
+                <option value="" disabled>
+                  No recipient lists found
+                </option>
               ) : (
-                <div className="text-xs text-slate-500">Clientseitig validiert vor PATCH</div>
+                recipients.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}
+                  </option>
+                ))
               )}
-            </div>
-            <div className="p-4">
-              <textarea
-                className="min-h-[260px] w-full rounded-md border border-slate-200 px-3 py-2 font-mono text-xs"
-                value={valuesText}
-                onChange={(e) => {
-                  setValuesText(e.target.value);
-                  setValuesError(null);
-                }}
-                spellCheck={false}
-              />
-            </div>
-          </section>
+            </select>
+            <p className="mt-2 text-xs text-neutral-500">
+              Quelle: <span className="font-mono">/api/admin/v1/recipients</span>
+            </p>
+          </div>
 
-          {/* Meta */}
-          <section className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <div className="text-sm font-medium">2) Meta (JSON)</div>
-              {metaError ? (
-                <div className="text-xs text-red-700">JSON Fehler: {metaError}</div>
-              ) : (
-                <div className="text-xs text-slate-500">Clientseitig validiert vor PATCH</div>
-              )}
-            </div>
-            <div className="p-4">
-              <textarea
-                className="min-h-[220px] w-full rounded-md border border-slate-200 px-3 py-2 font-mono text-xs"
-                value={metaText}
-                onChange={(e) => {
-                  setMetaText(e.target.value);
-                  setMetaError(null);
-                }}
-                spellCheck={false}
-              />
-            </div>
-          </section>
+          <div className="rounded-md border p-3">
+            <label className="block text-xs font-medium text-neutral-700">Subject (optional)</label>
+            <input
+              className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              placeholder="LeadRadar Messelead"
+              disabled={forwarding}
+            />
+          </div>
 
-          {/* Attachments */}
-          <section className="rounded-lg border border-slate-200 overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between">
-              <div className="text-sm font-medium">3) Attachments</div>
-              <div className="text-xs text-slate-500">
-                {(lead.attachments?.length ?? 0).toString()} file(s)
-              </div>
-            </div>
+          <div className="rounded-md border p-3">
+            <label className="block text-xs font-medium text-neutral-700">Message (optional)</label>
+            <textarea
+              className="mt-1 w-full resize-none rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-neutral-200"
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              rows={3}
+              placeholder="Kurzer Hinweis…"
+              disabled={forwarding}
+            />
+          </div>
+        </div>
 
-            {!lead.attachments || lead.attachments.length === 0 ? (
-              <div className="p-4 text-sm text-slate-600">Keine Attachments.</div>
-            ) : (
-              <div className="w-full overflow-auto">
-                <table className="min-w-full text-sm">
-                  <thead className="bg-slate-50 text-slate-600">
-                    <tr className="text-left">
-                      <th className="px-4 py-2 font-medium">filename</th>
-                      <th className="px-4 py-2 font-medium">type</th>
-                      <th className="px-4 py-2 font-medium">createdAt</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-200">
-                    {lead.attachments.map((a, idx) => (
-                      <tr key={a.id ?? `${idx}`}>
-                        <td className="px-4 py-2 font-mono text-xs text-slate-800">
-                          {a.filename ?? "—"}
-                        </td>
-                        <td className="px-4 py-2">{a.contentType ?? "—"}</td>
-                        <td className="px-4 py-2 whitespace-nowrap">
-                          {a.createdAt ? new Date(a.createdAt).toLocaleString() : "—"}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
-          {/* Danger zone */}
-          <section className="rounded-lg border border-red-200 overflow-hidden">
-            <div className="px-4 py-3 border-b border-red-200 flex items-center justify-between bg-red-50">
-              <div className="text-sm font-medium text-red-800">Danger Zone</div>
-              <div className="text-xs text-red-700">Soft-delete (DELETE)</div>
-            </div>
-
-            <div className="p-4 flex flex-col gap-3">
-              <div className="text-xs text-slate-600">
-                Optional: Reason wird (wenn API unterstützt) im DELETE-Body gesendet.
-              </div>
-
-              <input
-                className="w-full rounded-md border border-slate-200 px-3 py-2 text-sm"
-                placeholder="Reason (optional)…"
-                value={deleteReason}
-                onChange={(e) => setDeleteReason(e.target.value)}
-                disabled={Boolean(lead.deletedAt) || deleting || saving || loading}
-              />
-
-              <div className="flex items-center gap-2">
-                <button
-                  className="rounded-md border border-red-300 bg-white px-3 py-2 text-sm text-red-700 hover:bg-red-50 disabled:opacity-50"
-                  onClick={onDelete}
-                  disabled={Boolean(lead.deletedAt) || deleting || saving || loading}
-                  title={lead.deletedAt ? "Bereits deleted" : ""}
-                >
-                  {deleting ? "Löschen…" : "Soft-delete"}
-                </button>
-
-                {lead.deletedAt ? (
-                  <div className="text-xs text-slate-500">
-                    Lead ist deleted. (Undelete ist in diesem MVP nicht vorgesehen.)
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          </section>
-        </>
-      )}
+        {forwardResult ? (
+          <div className="mt-4 rounded-md border bg-neutral-50 p-3">
+            <div className="text-xs font-medium text-neutral-700">Result</div>
+            <pre className="mt-2 overflow-auto rounded-md bg-white p-3 text-xs">
+{safeStringify(forwardResult)}
+            </pre>
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
