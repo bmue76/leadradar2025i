@@ -28,6 +28,14 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={`${base} ${style}`}>{s}</span>;
 }
 
+function nextPrimaryAction(status: string): { label: string; toStatus: 'DRAFT' | 'ACTIVE' } | null {
+  const s = String(status || 'UNKNOWN').toUpperCase();
+  if (s === 'DRAFT') return { label: 'Aktivieren', toStatus: 'ACTIVE' };
+  if (s === 'ACTIVE') return { label: 'Deaktivieren', toStatus: 'DRAFT' };
+  if (s === 'ARCHIVED') return { label: 'Reaktivieren', toStatus: 'ACTIVE' };
+  return null;
+}
+
 function normalizeForm(rawData: any): Form {
   // Accept common shapes:
   // - { form: {...}, fields: [...] }
@@ -101,6 +109,9 @@ export function FormDetailClient({ formId }: { formId: string }) {
     | { status: 'error'; message: string; raw?: unknown }
   >({ status: 'idle' });
 
+  const [busy, setBusy] = React.useState(false);
+  const [actionError, setActionError] = React.useState('');
+
   async function load() {
     setState({ status: 'loading' });
 
@@ -134,17 +145,42 @@ export function FormDetailClient({ formId }: { formId: string }) {
     });
   }
 
+  async function patchStatus(toStatus: 'DRAFT' | 'ACTIVE' | 'ARCHIVED') {
+    setBusy(true);
+    setActionError('');
+
+    const res = await adminFetch<any>(`/api/admin/v1/forms/${encodeURIComponent(formId)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: toStatus }),
+    });
+
+    if (!res.ok) {
+      setBusy(false);
+      setActionError(res.error?.message ?? 'Status-Update fehlgeschlagen');
+      return;
+    }
+
+    await load();
+    setBusy(false);
+  }
+
   React.useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formId]);
+
+  const currentStatus = state.status === 'ok' ? pickStatus(state.form) : 'UNKNOWN';
+  const primary = nextPrimaryAction(currentStatus);
 
   return (
     <div className="space-y-6">
       <section className="rounded-xl border bg-white p-4 shadow-sm">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h2 className="text-lg font-semibold">{state.status === 'ok' ? pickName(state.form) : 'Form'}</h2>
+            <h2 className="text-lg font-semibold">
+              {state.status === 'ok' ? pickName(state.form) : 'Form'}
+            </h2>
             <p className="text-sm text-slate-600">
               GET{' '}
               <code className="rounded bg-slate-100 px-1 py-0.5">
@@ -171,8 +207,8 @@ export function FormDetailClient({ formId }: { formId: string }) {
               <div className="mt-1">{state.message}</div>
 
               <div className="mt-3 text-xs text-red-900/80">
-                DEV-Tipp: Setze oben im Header eine gültige <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code>{' '}
-                und lade neu.
+                DEV-Tipp: Setze oben im Header eine gültige{' '}
+                <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code> und lade neu.
               </div>
 
               {state.raw ? (
@@ -187,12 +223,50 @@ export function FormDetailClient({ formId }: { formId: string }) {
           ) : (
             <div className="grid gap-3 md:grid-cols-2">
               <div className="rounded-lg border bg-slate-50 p-3">
-                <div className="text-xs font-medium text-slate-600">Status</div>
-                <div className="mt-2">
-                  <StatusBadge status={pickStatus(state.form)} />
-                  <span className="ml-2 text-xs text-slate-500">
-                    (Toggle/Action folgt in 2.1)
-                  </span>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-medium text-slate-600">Status</div>
+                    <div className="mt-2 flex items-center gap-2">
+                      <StatusBadge status={currentStatus} />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col items-end gap-1">
+                    <div className="flex items-center gap-2">
+                      {primary ? (
+                        <button
+                          type="button"
+                          onClick={() => void patchStatus(primary.toStatus)}
+                          disabled={busy}
+                          className="rounded-md border px-2 py-1 text-xs hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                          title={`Setzt Status auf ${primary.toStatus}`}
+                        >
+                          {busy ? 'Speichern…' : primary.label}
+                        </button>
+                      ) : null}
+
+                      {String(currentStatus).toUpperCase() !== 'ARCHIVED' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!confirm('Form wirklich archivieren?')) return;
+                            void patchStatus('ARCHIVED');
+                          }}
+                          disabled={busy}
+                          className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                          title="Archiviert das Form"
+                        >
+                          {busy ? '…' : 'Archivieren'}
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {actionError ? (
+                      <div className="max-w-[520px] text-right text-xs text-red-700">
+                        {actionError}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </div>
 

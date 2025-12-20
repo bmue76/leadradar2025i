@@ -38,7 +38,6 @@ function pickFieldsCount(f: Form): string {
 function StatusBadge({ status }: { status: string }) {
   const s = String(status || 'UNKNOWN').toUpperCase();
 
-  // Neutral defaults (we avoid domain assumptions; 2.1 will make this interactive)
   const base = 'inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium';
   const style =
     s === 'ACTIVE'
@@ -52,12 +51,23 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={`${base} ${style}`}>{s}</span>;
 }
 
+function nextPrimaryAction(status: string): { label: string; toStatus: 'DRAFT' | 'ACTIVE' } | null {
+  const s = String(status || 'UNKNOWN').toUpperCase();
+  if (s === 'DRAFT') return { label: 'Aktivieren', toStatus: 'ACTIVE' };
+  if (s === 'ACTIVE') return { label: 'Deaktivieren', toStatus: 'DRAFT' };
+  if (s === 'ARCHIVED') return { label: 'Reaktivieren', toStatus: 'ACTIVE' };
+  return null;
+}
+
 export function FormsListClient() {
   const [state, setState] = React.useState<
     | { status: 'loading' | 'idle' }
     | { status: 'ok'; items: Form[]; paging?: any; raw: unknown }
     | { status: 'error'; message: string; raw?: unknown }
   >({ status: 'idle' });
+
+  const [busyById, setBusyById] = React.useState<Record<string, boolean>>({});
+  const [actionErrorById, setActionErrorById] = React.useState<Record<string, string>>({});
 
   async function load() {
     setState({ status: 'loading' });
@@ -75,6 +85,30 @@ export function FormsListClient() {
       message: res.error?.message ?? 'Unbekannter Fehler',
       raw: res.raw,
     });
+  }
+
+  async function patchStatus(formId: string, toStatus: 'DRAFT' | 'ACTIVE' | 'ARCHIVED') {
+    setBusyById((m) => ({ ...m, [formId]: true }));
+    setActionErrorById((m) => ({ ...m, [formId]: '' }));
+
+    const res = await adminFetch<any>(`/api/admin/v1/forms/${formId}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: toStatus }),
+    });
+
+    if (!res.ok) {
+      setBusyById((m) => ({ ...m, [formId]: false }));
+      setActionErrorById((m) => ({
+        ...m,
+        [formId]: res.error?.message ?? 'Status-Update fehlgeschlagen',
+      }));
+      return;
+    }
+
+    // Refresh list (no-store fetch vorhanden)
+    await load();
+    setBusyById((m) => ({ ...m, [formId]: false }));
   }
 
   React.useEffect(() => {
@@ -110,8 +144,8 @@ export function FormsListClient() {
             <div className="mt-1">{state.message}</div>
 
             <div className="mt-3 text-xs text-red-900/80">
-              DEV-Tipp: Setze oben im Header eine gültige <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code>{' '}
-              und lade neu.
+              DEV-Tipp: Setze oben im Header eine gültige{' '}
+              <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code> und lade neu.
             </div>
 
             {state.raw ? (
@@ -128,16 +162,10 @@ export function FormsListClient() {
             <div className="flex items-center justify-between">
               <div className="text-sm text-slate-700">
                 Gefunden: <span className="font-medium">{state.items.length}</span>
-                {state.paging ? (
-                  <span className="ml-2 text-xs text-slate-500">
-                    (Paging vorhanden)
-                  </span>
-                ) : null}
+                {state.paging ? <span className="ml-2 text-xs text-slate-500">(Paging vorhanden)</span> : null}
               </div>
 
-              <div className="text-xs text-slate-500">
-                Status sichtbar (Action folgt in 2.1)
-              </div>
+              <div className="text-xs text-slate-500">Status toggle via PATCH (2.1)</div>
             </div>
 
             <div className="overflow-auto rounded-lg border">
@@ -153,31 +181,72 @@ export function FormsListClient() {
                   </tr>
                 </thead>
                 <tbody>
-                  {state.items.map((f, idx) => (
-                    <tr key={f?.id ?? idx} className="border-t">
-                      <td className="px-3 py-2 font-medium text-slate-900">
-                        {pickName(f)}
-                      </td>
-                      <td className="px-3 py-2">
-                        <StatusBadge status={pickStatus(f)} />
-                      </td>
-                      <td className="px-3 py-2 text-slate-700">{pickFieldsCount(f)}</td>
-                      <td className="px-3 py-2 text-slate-700">{pickUpdated(f) || '—'}</td>
-                      <td className="px-3 py-2 font-mono text-xs text-slate-700">{f?.id ?? '—'}</td>
-                      <td className="px-3 py-2 text-right">
-                        {f?.id ? (
-                          <Link
-                            href={`/admin/forms/${f.id}`}
-                            className="rounded-md border px-2 py-1 text-xs hover:bg-slate-50"
-                          >
-                            Öffnen
-                          </Link>
-                        ) : (
-                          <span className="text-xs text-slate-500">—</span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                  {state.items.map((f, idx) => {
+                    const id = f?.id as string | undefined;
+                    const status = pickStatus(f);
+                    const primary = nextPrimaryAction(status);
+
+                    return (
+                      <tr key={id ?? idx} className="border-t">
+                        <td className="px-3 py-2 font-medium text-slate-900">{pickName(f)}</td>
+                        <td className="px-3 py-2">
+                          <StatusBadge status={status} />
+                        </td>
+                        <td className="px-3 py-2 text-slate-700">{pickFieldsCount(f)}</td>
+                        <td className="px-3 py-2 text-slate-700">{pickUpdated(f) || '—'}</td>
+                        <td className="px-3 py-2 font-mono text-xs text-slate-700">{id ?? '—'}</td>
+                        <td className="px-3 py-2 text-right">
+                          {id ? (
+                            <div className="flex flex-col items-end gap-1">
+                              <div className="flex items-center justify-end gap-2">
+                                <Link
+                                  href={`/admin/forms/${id}`}
+                                  className="rounded-md border px-2 py-1 text-xs hover:bg-slate-50"
+                                >
+                                  Öffnen
+                                </Link>
+
+                                {primary ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void patchStatus(id, primary.toStatus)}
+                                    disabled={!!busyById[id]}
+                                    className="rounded-md border px-2 py-1 text-xs hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                    title={`Setzt Status auf ${primary.toStatus}`}
+                                  >
+                                    {busyById[id] ? 'Speichern…' : primary.label}
+                                  </button>
+                                ) : null}
+
+                                {String(status).toUpperCase() !== 'ARCHIVED' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (!confirm('Form wirklich archivieren?')) return;
+                                      void patchStatus(id, 'ARCHIVED');
+                                    }}
+                                    disabled={!!busyById[id]}
+                                    className="rounded-md border border-slate-200 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                    title="Archiviert das Form"
+                                  >
+                                    {busyById[id] ? '…' : 'Archivieren'}
+                                  </button>
+                                ) : null}
+                              </div>
+
+                              {actionErrorById[id] ? (
+                                <div className="max-w-[420px] text-right text-xs text-red-700">
+                                  {actionErrorById[id]}
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-slate-500">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
 
                   {state.items.length === 0 ? (
                     <tr className="border-t">
@@ -191,9 +260,7 @@ export function FormsListClient() {
             </div>
 
             <details className="rounded-lg border bg-slate-50 p-3">
-              <summary className="cursor-pointer text-sm font-medium text-slate-800">
-                Debug: Raw JSON
-              </summary>
+              <summary className="cursor-pointer text-sm font-medium text-slate-800">Debug: Raw JSON</summary>
               <pre className="mt-3 overflow-auto text-xs text-slate-900">
                 {JSON.stringify(state.raw, null, 2)}
               </pre>
