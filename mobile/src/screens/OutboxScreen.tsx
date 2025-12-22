@@ -3,20 +3,32 @@ import { Alert, FlatList, Pressable, StyleSheet, Text, View } from "react-native
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useSettings } from "../storage/SettingsContext";
-import { mobilePostJson } from "../lib/mobileApi";
-import { clearOutbox, loadOutbox, removeOutboxItem, updateOutboxItem, type OutboxItem } from "../storage/outbox";
+import { clearOutbox, loadOutbox, removeOutboxItem, type OutboxItem } from "../storage/outbox";
 import { DEMO_FORM_ID } from "../lib/demoForms";
+import { syncOutboxNow } from "../sync/outboxSync";
+import { OutboxAutoSyncIndicator, useOutboxSyncStatus } from "../sync/outboxAutoSync";
 
 function isDemoLead(item: OutboxItem) {
   return item.formId === DEMO_FORM_ID || item.formId.startsWith("demo-");
+}
+
+function fmt(iso?: string) {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
 }
 
 export default function OutboxScreen() {
   const { isLoaded, baseUrl, tenantSlug } = useSettings();
   const [items, setItems] = useState<OutboxItem[]>([]);
   const [loading, setLoading] = useState(false);
-  const [syncing, setSyncing] = useState(false);
   const [lastResult, setLastResult] = useState<string | null>(null);
+
+  const syncStatus = useOutboxSyncStatus();
+  const syncing = !!syncStatus.syncing;
 
   const demoCount = useMemo(() => items.filter(isDemoLead).length, [items]);
   const realCount = useMemo(() => items.length - demoCount, [items, demoCount]);
@@ -34,6 +46,13 @@ export default function OutboxScreen() {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  // When auto/manual sync finishes -> refresh list
+  useEffect(() => {
+    if (!syncStatus.syncing && syncStatus.finishedAt) {
+      void reload();
+    }
+  }, [syncStatus.syncing, syncStatus.finishedAt, reload]);
 
   const canSync = useMemo(() => isLoaded && !!baseUrl && !!tenantSlug, [isLoaded, baseUrl, tenantSlug]);
 
@@ -59,67 +78,23 @@ export default function OutboxScreen() {
   async function syncNow() {
     setLastResult(null);
 
-    if (!canSync) {
-      setLastResult("Cannot sync: missing baseUrl/tenantSlug (Settings) or settings not loaded.");
-      return;
-    }
+    const res = await syncOutboxNow({
+      baseUrl: baseUrl || undefined,
+      tenantSlug: tenantSlug || undefined,
+      reason: "manual",
+      timeoutMs: 8000,
+    });
 
-    setSyncing(true);
-
-    let ok = 0;
-    let failed = 0;
-    let skipped = 0;
-
-    try {
-      const current = await loadOutbox();
-
-      for (const item of current) {
-        // Demo items are local-only; backend can't accept them.
-        if (isDemoLead(item)) {
-          skipped += 1;
-          await updateOutboxItem(item.id, {
-            lastError: "Demo lead (local only) — delete this item when done testing.",
-          });
-          continue;
-        }
-
-        try {
-          await mobilePostJson({
-            baseUrl: baseUrl!,
-            tenantSlug: tenantSlug!,
-            path: "/api/mobile/v1/leads",
-            timeoutMs: 8000,
-            body: {
-              formId: item.formId,
-              clientLeadId: item.clientLeadId,
-              values: item.values,
-              capturedByDeviceUid: item.capturedByDeviceUid,
-            },
-          });
-
-          ok += 1;
-          await removeOutboxItem(item.id);
-        } catch (e: any) {
-          failed += 1;
-          const msg = e?.message ? String(e.message) : "Sync failed";
-          await updateOutboxItem(item.id, {
-            tries: (item.tries ?? 0) + 1,
-            lastError: msg,
-          });
-        }
-      }
-
-      setLastResult(`Sync finished: ok=${ok}, failed=${failed}, skipped(demo)=${skipped}`);
-    } finally {
-      setSyncing(false);
-      await reload();
-    }
+    setLastResult(res.message);
+    await reload();
   }
 
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.container}>
         <Text style={styles.h1}>Outbox</Text>
+
+        <OutboxAutoSyncIndicator />
 
         <View style={styles.debugCard}>
           <Text style={styles.debugTitle}>Debug</Text>
@@ -130,9 +105,11 @@ export default function OutboxScreen() {
             tenantSlug: <Text style={styles.mono}>{tenantSlug || "—"}</Text>
           </Text>
           <Text style={styles.debugLine}>
-            queued: <Text style={styles.mono}>{String(items.length)}</Text> (real{" "}
-            <Text style={styles.mono}>{String(realCount)}</Text>, demo{" "}
+            queued: <Text style={styles.mono}>{String(items.length)}</Text> (real <Text style={styles.mono}>{String(realCount)}</Text>, demo{" "}
             <Text style={styles.mono}>{String(demoCount)}</Text>)
+          </Text>
+          <Text style={styles.debugLine}>
+            lastSync: <Text style={styles.mono}>{fmt(syncStatus.finishedAt)}</Text>
           </Text>
           {lastResult ? <Text style={styles.result}>{lastResult}</Text> : null}
         </View>
