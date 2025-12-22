@@ -59,9 +59,10 @@ export function OutboxAutoSyncIndicator() {
 /**
  * Auto-Sync Engine:
  * - on app start (once)
+ * - on settings become ready (once)  ✅ FIX for "already online" case
  * - on foreground
  * - on offline->online transition
- * - backoff retry on failures (1s,2s,5s,10s,... max 30s)
+ * - backoff retry on failures (1s,2s,4s,... max 30s)
  * - cancels retry when offline, resets on success
  */
 export function useOutboxAutoSyncGate() {
@@ -69,9 +70,11 @@ export function useOutboxAutoSyncGate() {
   const net = useNetInfo();
 
   const online = !!(net.isConnected && net.isInternetReachable !== false);
+  const settingsReady = !!(isLoaded && baseUrl && tenantSlug);
 
   const startedRef = useRef(false);
   const prevOnlineRef = useRef<boolean | null>(null);
+  const readyTriggeredRef = useRef(false);
 
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const backoffRef = useRef<number>(1000);
@@ -96,7 +99,6 @@ export function useOutboxAutoSyncGate() {
         void maybeSync(`retry:${reason}`);
       }, delay);
 
-      // simple exponential-ish (1s,2s,4s,8s,16s,30s cap)
       backoffRef.current = Math.min(backoffRef.current * 2, 30000);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -106,11 +108,11 @@ export function useOutboxAutoSyncGate() {
   const maybeSync = useCallback(
     async (reason: string) => {
       if (!online) return;
-      if (!isLoaded || !baseUrl || !tenantSlug) return;
+      if (!settingsReady) return;
 
       const res = await syncOutboxNow({
-        baseUrl,
-        tenantSlug,
+        baseUrl: baseUrl || undefined,
+        tenantSlug: tenantSlug || undefined,
         reason,
         isOnline: online,
         timeoutMs: 8000,
@@ -123,7 +125,7 @@ export function useOutboxAutoSyncGate() {
         clearRetry();
       }
     },
-    [online, isLoaded, baseUrl, tenantSlug, scheduleRetry, resetBackoff, clearRetry]
+    [online, settingsReady, baseUrl, tenantSlug, scheduleRetry, resetBackoff, clearRetry]
   );
 
   // App start once
@@ -131,7 +133,6 @@ export function useOutboxAutoSyncGate() {
     if (startedRef.current) return;
     startedRef.current = true;
 
-    // Ensure we have a reachability snapshot
     NetInfo.fetch()
       .then(() => {
         void maybeSync("start");
@@ -144,6 +145,21 @@ export function useOutboxAutoSyncGate() {
       clearRetry();
     };
   }, [maybeSync, clearRetry]);
+
+  // ✅ NEW: Settings become ready while already online (common case)
+  useEffect(() => {
+    if (!online) return;
+
+    if (!settingsReady) {
+      readyTriggeredRef.current = false; // allow trigger once after readiness returns
+      return;
+    }
+
+    if (readyTriggeredRef.current) return;
+    readyTriggeredRef.current = true;
+
+    void maybeSync("ready");
+  }, [online, settingsReady, maybeSync]);
 
   // Foreground trigger
   useEffect(() => {
@@ -160,7 +176,7 @@ export function useOutboxAutoSyncGate() {
     const prev = prevOnlineRef.current;
     prevOnlineRef.current = online;
 
-    if (prev === null) return; // first run handled by start
+    if (prev === null) return; // first run handled by start/ready
     if (prev === false && online === true) {
       void maybeSync("online");
     }
