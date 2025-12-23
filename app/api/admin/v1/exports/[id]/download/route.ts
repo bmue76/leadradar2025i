@@ -7,8 +7,25 @@ import { getTraceId, jsonError } from "@/lib/api";
 
 export const runtime = "nodejs";
 
-function exportIdFromCtxOrUrl(req: Request, ctx?: { params?: { id?: string } }): string {
-  const fromCtx = ctx?.params?.id?.trim();
+type ParamsObj = { id?: string };
+type RouteCtx = { params?: ParamsObj | Promise<ParamsObj> };
+
+async function getIdFromCtx(ctx?: RouteCtx): Promise<string> {
+  const p: any = ctx?.params;
+  if (!p) return "";
+
+  try {
+    // Next.js can pass params as a Promise (sync-dynamic-apis)
+    const resolved: ParamsObj = typeof p?.then === "function" ? await p : (p as ParamsObj);
+    const id = resolved?.id ? String(resolved.id).trim() : "";
+    return id;
+  } catch {
+    return "";
+  }
+}
+
+async function exportIdFromCtxOrUrl(req: Request, ctx?: RouteCtx): Promise<string> {
+  const fromCtx = await getIdFromCtx(ctx);
   if (fromCtx) return fromCtx;
 
   // Fallback: /api/admin/v1/exports/{id}/download
@@ -32,11 +49,11 @@ function safeFilename(s: string): string {
     .slice(0, 80);
 }
 
-export async function GET(req: Request, ctx: { params?: { id?: string } }) {
+export async function GET(req: Request, ctx: RouteCtx) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const id = exportIdFromCtxOrUrl(req, ctx);
+  const id = await exportIdFromCtxOrUrl(req, ctx);
   if (!id) return jsonError(req, 400, "INVALID_PARAMS", "Missing export id.");
 
   const job = await prisma.exportJob.findFirst({
@@ -71,7 +88,8 @@ export async function GET(req: Request, ctx: { params?: { id?: string } }) {
     return jsonError(req, 404, "NOT_FOUND", "Export file not found on disk.");
   }
 
-  const buf = fs.readFileSync(resolved);
+  // CSV is TEXT → simplest + TS-safe
+  const csvText = fs.readFileSync(resolved, "utf8");
 
   const traceId = getTraceId(req);
   const h = new Headers();
@@ -83,5 +101,5 @@ export async function GET(req: Request, ctx: { params?: { id?: string } }) {
   const filename = `${base}_${date}_${job.id}.csv`;
   h.set("content-disposition", `attachment; filename="${filename}"`);
 
-  return new Response(buf, { status: 200, headers: h });
+  return new Response(csvText, { status: 200, headers: h });
 }
