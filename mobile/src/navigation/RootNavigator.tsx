@@ -10,6 +10,7 @@ import OutboxScreen from "../screens/OutboxScreen";
 import SettingsScreen from "../screens/SettingsScreen";
 import CaptureScreen from "../screens/CaptureScreen";
 import ActivationScreen from "../screens/ActivationScreen";
+import StartScreen from "../screens/StartScreen";
 
 import { useSettings } from "../storage/SettingsContext";
 import { useActivation } from "../storage/ActivationContext";
@@ -62,14 +63,15 @@ function AppNavigator() {
   );
 }
 
-function LockedNavigator({ initial }: { initial: keyof LockedStackParamList }) {
+function LockedNavigator() {
   return (
     <LockedStack.Navigator
-      initialRouteName={initial}
+      initialRouteName="Start"
       screenOptions={{
         headerTitleAlign: "center",
       }}
     >
+      <LockedStack.Screen name="Start" component={StartScreen} options={{ headerShown: false }} />
       <LockedStack.Screen name="Activation" component={ActivationScreen} options={{ title: "Activation" }} />
       <LockedStack.Screen name="Settings" component={SettingsScreen} options={{ title: "Settings" }} />
     </LockedStack.Navigator>
@@ -84,19 +86,18 @@ export default function RootNavigator() {
     return Boolean(settings.baseUrl && settings.tenantSlug);
   }, [settings.baseUrl, settings.tenantSlug]);
 
-  // Neutral boot (kurz) – KEIN Aktivierungs-Startscreen
+  // Boot/Loading: bis Settings + Activation geladen sind (kein UI-Flackern)
   if (!settings.isLoaded || !activation.isLoaded) {
     return <BootNavigator />;
   }
 
-  // Unlocked -> direkt in App (kein Startscreen)
+  // Unlocked -> direkt in App (kein Startscreen/Activation Flash)
   if (hasSettings && activation.isActiveNow) {
     return <AppNavigator />;
   }
 
-  // Locked -> Aktivierung/Settings erreichbar
-  const initial: keyof LockedStackParamList = hasSettings ? "Activation" : "Settings";
-  return <LockedNavigator initial={initial} />;
+  // Locked -> StartScreen Einstieg, von dort Activation/Settings
+  return <LockedNavigator />;
 }
 
 const styles = StyleSheet.create({

@@ -12,6 +12,7 @@ export type RootStackParamList = {
 };
 
 export type LockedStackParamList = {
+  Start: undefined;
   Activation: undefined;
   Settings: undefined;
 };
