@@ -1,18 +1,25 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import {
   clearActivation,
+  clearDenied,
   isActivationValidNow,
   loadActivation,
   saveActivation,
+  saveDenied,
   type ActivationRecord,
 } from "./activation";
 
 type ActivationState = {
   isLoaded: boolean;
+
   active: boolean;
   expiresAt: string | null;
   keyLast4: string | null;
   licenseKeyId: string | null;
+
+  lastDeniedCode: string | null;
+  lastDeniedMessage: string | null;
+  lastDeniedAt: string | null;
 
   isActiveNow: boolean;
 
@@ -23,6 +30,8 @@ type ActivationState = {
     keyLast4: string | null;
     licenseKeyId: string | null;
   }) => Promise<void>;
+  setDenied: (input: { code: string | null; message: string | null }) => Promise<void>;
+  clearDenied: () => Promise<void>;
   clear: () => Promise<void>;
 };
 
@@ -35,6 +44,11 @@ export function ActivationProvider({ children }: { children: React.ReactNode }) 
     expiresAt: null,
     keyLast4: null,
     licenseKeyId: null,
+
+    lastDeniedCode: null,
+    lastDeniedMessage: null,
+    lastDeniedAt: null,
+
     updatedAt: new Date(0).toISOString(),
   });
 
@@ -61,12 +75,27 @@ export function ActivationProvider({ children }: { children: React.ReactNode }) 
     keyLast4: string | null;
     licenseKeyId: string | null;
   }) => {
+    // Success path clears lastDenied fields
     const rec = await saveActivation({
       active: input.active,
       expiresAt: input.expiresAt,
       keyLast4: input.keyLast4,
       licenseKeyId: input.licenseKeyId,
+
+      lastDeniedCode: null,
+      lastDeniedMessage: null,
+      lastDeniedAt: null,
     });
+    setRecord(rec);
+  };
+
+  const setDeniedFn = async (input: { code: string | null; message: string | null }) => {
+    const rec = await saveDenied({ code: input.code, message: input.message });
+    setRecord(rec);
+  };
+
+  const clearDeniedFn = async () => {
+    const rec = await clearDenied();
     setRecord(rec);
   };
 
@@ -84,13 +113,22 @@ export function ActivationProvider({ children }: { children: React.ReactNode }) 
     const isActiveNow = isActivationValidNow(record);
     return {
       isLoaded,
+
       active: record.active,
       expiresAt: record.expiresAt,
       keyLast4: record.keyLast4,
       licenseKeyId: record.licenseKeyId,
+
+      lastDeniedCode: record.lastDeniedCode,
+      lastDeniedMessage: record.lastDeniedMessage,
+      lastDeniedAt: record.lastDeniedAt,
+
       isActiveNow,
+
       refresh,
       applyActivation,
+      setDenied: setDeniedFn,
+      clearDenied: clearDeniedFn,
       clear,
     };
   }, [isLoaded, record, tick]);

@@ -137,6 +137,10 @@ export default function ActivationScreen() {
       if (!res.ok) {
         const e = pickError(json);
         const msg = friendlyMessage(e.code, e.message || `HTTP ${res.status}`);
+
+        // Persist denied info so StartScreen can show "backend_denied"
+        await activation.setDenied({ code: e.code ?? null, message: msg });
+
         setLastError({ code: e.code, message: msg });
         Alert.alert("Aktivierung fehlgeschlagen", msg + (e.code ? `\n\nCode: ${e.code}` : ""));
         return;

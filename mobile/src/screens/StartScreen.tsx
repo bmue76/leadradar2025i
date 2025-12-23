@@ -7,11 +7,7 @@ import { useNetInfo } from "@react-native-community/netinfo";
 import { useSettings } from "../storage/SettingsContext";
 import { useActivation } from "../storage/ActivationContext";
 
-type LockReason =
-  | "missing_settings"
-  | "missing_license"
-  | "expired"
-  | "backend_denied";
+type LockReason = "missing_settings" | "missing_license" | "expired" | "backend_denied";
 
 function fmtDate(iso: string | null) {
   if (!iso) return "—";
@@ -33,19 +29,6 @@ function reasonTitle(r: LockReason) {
   }
 }
 
-function reasonText(r: LockReason) {
-  switch (r) {
-    case "missing_settings":
-      return "Bitte baseUrl und tenantSlug in den Einstellungen setzen, damit die App aktiviert werden kann.";
-    case "missing_license":
-      return "Diese App ist noch nicht aktiviert. Bitte Lizenz aktivieren.";
-    case "expired":
-      return "Die Lizenz ist abgelaufen. Bitte verlängern oder erneut aktivieren.";
-    case "backend_denied":
-      return "Die Lizenz wurde abgelehnt oder ist nicht mehr gültig. Bitte erneut aktivieren oder Support kontaktieren.";
-  }
-}
-
 export default function StartScreen() {
   const nav = useNavigation<any>();
   const net = useNetInfo();
@@ -58,16 +41,35 @@ export default function StartScreen() {
     return Boolean(settings.baseUrl && settings.tenantSlug);
   }, [settings.baseUrl, settings.tenantSlug]);
 
+  const hasDenied = useMemo(() => {
+    return Boolean(activation.lastDeniedCode || activation.lastDeniedMessage);
+  }, [activation.lastDeniedCode, activation.lastDeniedMessage]);
+
   const lockReason = useMemo<LockReason>(() => {
     if (!hasSettings) return "missing_settings";
-    if (!activation.active) return "missing_license";
     if (activation.active && activation.expiresAt && !activation.isActiveNow) return "expired";
-    // fallback: wenn active=false wird oben abgefangen; wenn active=true aber isActiveNow trotzdem false -> denied/unknown
-    return "backend_denied";
-  }, [hasSettings, activation.active, activation.expiresAt, activation.isActiveNow]);
+    if (hasDenied) return "backend_denied";
+    return "missing_license";
+  }, [hasSettings, activation.active, activation.expiresAt, activation.isActiveNow, hasDenied]);
+
+  const mainText = useMemo(() => {
+    switch (lockReason) {
+      case "missing_settings":
+        return "Bitte baseUrl und tenantSlug in den Einstellungen setzen, damit die App aktiviert werden kann.";
+      case "missing_license":
+        return "Diese App ist noch nicht aktiviert. Bitte Lizenz aktivieren.";
+      case "expired":
+        return "Die Lizenz ist abgelaufen. Bitte verlängern oder erneut aktivieren.";
+      case "backend_denied": {
+        const detail = activation.lastDeniedMessage || "Aktivierung wurde abgelehnt.";
+        const code = activation.lastDeniedCode ? ` (Code: ${activation.lastDeniedCode})` : "";
+        return `${detail}${code}\n\nBitte erneut aktivieren oder Einstellungen prüfen.`;
+      }
+    }
+  }, [lockReason, activation.lastDeniedMessage, activation.lastDeniedCode]);
 
   const showOfflineHint = useMemo(() => {
-    // Offline ist “relevant”, wenn Settings vorhanden sind (dann würde Aktivierung/Sync online gehen)
+    // "offline" ist relevant, wenn Settings vorhanden sind (Aktivierung benötigt Internet)
     return hasSettings && !online;
   }, [hasSettings, online]);
 
@@ -82,14 +84,12 @@ export default function StartScreen() {
         <View style={styles.card}>
           <Text style={styles.statusLabel}>STATUS</Text>
           <Text style={styles.statusTitle}>{reasonTitle(lockReason)}</Text>
-          <Text style={styles.statusText}>{reasonText(lockReason)}</Text>
+          <Text style={styles.statusText}>{mainText}</Text>
 
           {showOfflineHint ? (
             <View style={styles.offlineBox}>
               <Text style={styles.offlineTitle}>Offline</Text>
-              <Text style={styles.offlineText}>
-                Du bist aktuell offline. Aktivierung benötigt Internet.
-              </Text>
+              <Text style={styles.offlineText}>Du bist aktuell offline. Aktivierung benötigt Internet.</Text>
             </View>
           ) : null}
         </View>
@@ -116,6 +116,8 @@ export default function StartScreen() {
             <Line k="expiresAt" v={fmtDate(activation.expiresAt)} mono />
             <Line k="keyLast4" v={activation.keyLast4 ?? "—"} mono />
             <Line k="licenseKeyId" v={activation.licenseKeyId ?? "—"} mono />
+            <Line k="lastDeniedCode" v={activation.lastDeniedCode ?? "—"} mono />
+            <Line k="lastDeniedAt" v={fmtDate(activation.lastDeniedAt)} mono />
             <Line k="reason" v={lockReason} mono />
           </View>
         ) : null}
