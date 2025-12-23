@@ -4,6 +4,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useSettings } from "../storage/SettingsContext";
 import { useActivation } from "../storage/ActivationContext";
+import { BrandMark } from "../components/BrandMark";
 
 function fmtDate(iso: string | null) {
   if (!iso) return "—";
@@ -68,7 +69,10 @@ export default function SettingsScreen() {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.wrap}>
-        <Text style={styles.h1}>Settings</Text>
+        <View style={styles.header}>
+          <BrandMark variant="combo" size="md" />
+          <Text style={styles.h1}>Settings</Text>
+        </View>
 
         <View style={styles.card}>
           <Text style={styles.label}>Device UID</Text>
@@ -125,6 +129,11 @@ export default function SettingsScreen() {
             Löscht AsyncStorage-Key <Text style={styles.monoInline}>lr:activation</Text> und sperrt die App wieder.
           </Text>
         </View>
+
+        <View style={styles.footerBrand}>
+          <BrandMark variant="icon" size="sm" showText={false} />
+          <Text style={styles.footerText}>LeadRadar</Text>
+        </View>
       </View>
     </SafeAreaView>
   );
@@ -133,6 +142,8 @@ export default function SettingsScreen() {
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: "white" },
   wrap: { flex: 1, padding: 16, gap: 10 },
+
+  header: { gap: 8, paddingTop: 4 },
   h1: { fontSize: 28, fontWeight: "800" },
 
   card: { borderWidth: 1, borderColor: "#e7e7ea", borderRadius: 12, padding: 12, backgroundColor: "#fafafa" },
@@ -158,4 +169,7 @@ const styles = StyleSheet.create({
   btnDangerText: { color: "#b91c1c", fontWeight: "900" },
 
   foot: { fontSize: 12, color: "#667085" },
+
+  footerBrand: { marginTop: 18, flexDirection: "row", alignItems: "center", gap: 8, opacity: 0.55 },
+  footerText: { fontSize: 12, fontWeight: "800" },
 });

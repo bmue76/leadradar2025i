@@ -1,19 +1,20 @@
 import React, { useMemo, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
+  Platform,
   Pressable,
   StyleSheet,
   Text,
   TextInput,
   View,
-  Platform,
-  ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useNavigation } from "@react-navigation/native";
 
 import { useSettings } from "../storage/SettingsContext";
 import { useActivation } from "../storage/ActivationContext";
+import { BrandMark } from "../components/BrandMark";
 
 type ApiErr = { code?: string; message?: string };
 
@@ -27,15 +28,15 @@ function fmtDate(iso: string | null) {
 function friendlyMessage(code?: string, fallback?: string) {
   switch (code) {
     case "PAYMENT_PENDING":
-      return "Zahlung ausstehend. Bitte Zahlung/Verlängerung abschliessen und danach erneut aktivieren.";
+      return "Zahlung ausstehend. Bitte Verlängerung abschliessen und danach erneut aktivieren.";
     case "KEY_ALREADY_BOUND":
       return "Dieser Aktivierungscode ist bereits an ein anderes Gerät gebunden (1 Key = 1 Device).";
     case "LICENSE_EXPIRED":
-      return "Lizenz abgelaufen. Bitte verlängern oder einen neuen Aktivierungscode verwenden.";
+      return "Lizenz abgelaufen. Bitte verlängern oder neuen Aktivierungscode verwenden.";
     case "TENANT_REQUIRED":
-      return "Mandant fehlt. Bitte tenantSlug in den Settings setzen.";
+      return "Tenant fehlt. Bitte in den Settings den Tenant setzen.";
     case "TENANT_NOT_FOUND":
-      return "Mandant nicht gefunden. Bitte tenantSlug prüfen.";
+      return "Tenant nicht gefunden. Bitte Tenant prüfen.";
     default:
       return fallback || "Aktivierung fehlgeschlagen. Bitte prüfen und erneut versuchen.";
   }
@@ -80,9 +81,10 @@ export default function ActivationScreen() {
       settings.isLoaded &&
       activation.isLoaded &&
       Boolean(settings.baseUrl) &&
-      Boolean(settings.tenantSlug)
+      Boolean(settings.tenantSlug) &&
+      Boolean(settings.deviceUid)
     );
-  }, [busy, settings.isLoaded, activation.isLoaded, settings.baseUrl, settings.tenantSlug]);
+  }, [busy, settings.isLoaded, activation.isLoaded, settings.baseUrl, settings.tenantSlug, settings.deviceUid]);
 
   const onActivate = async () => {
     setLastError(null);
@@ -93,12 +95,12 @@ export default function ActivationScreen() {
       return;
     }
     if (!settings.tenantSlug) {
-      Alert.alert("tenantSlug fehlt", "Bitte zuerst in Settings den tenantSlug setzen.");
+      Alert.alert("Tenant fehlt", "Bitte zuerst in Settings den Tenant setzen.");
       nav.navigate("Settings");
       return;
     }
     if (!settings.baseUrl) {
-      Alert.alert("baseUrl fehlt", "Bitte zuerst in Settings die baseUrl setzen.");
+      Alert.alert("Basis-URL fehlt", "Bitte zuerst in Settings die Basis-URL setzen.");
       nav.navigate("Settings");
       return;
     }
@@ -158,10 +160,13 @@ export default function ActivationScreen() {
         licenseKeyId: ok.licenseKeyId ?? null,
       });
 
+      // extra-robust: ensure denied is cleared after success
+      await activation.clearDenied();
+
       Alert.alert("Aktiviert", `Lizenz ist aktiv.\nGültig bis: ${fmtDate(expiresAt)}`);
       // RootNavigator switcht automatisch, sobald activation.isActiveNow true ist.
     } catch {
-      const msg = "Keine Verbindung / Request fehlgeschlagen. Bitte Netzwerk & baseUrl prüfen.";
+      const msg = "Keine Verbindung / Request fehlgeschlagen. Bitte Netzwerk & Basis-URL prüfen.";
       setLastError({ message: msg });
       Alert.alert("Aktivierung fehlgeschlagen", msg);
     } finally {
@@ -170,6 +175,7 @@ export default function ActivationScreen() {
   };
 
   const onDemo60 = async () => {
+    if (busy) return;
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
     await activation.applyActivation({
       active: true,
@@ -177,10 +183,12 @@ export default function ActivationScreen() {
       keyLast4: "DEMO",
       licenseKeyId: "demo-60m",
     });
+    await activation.clearDenied();
     Alert.alert("Demo aktiv", `Demo ist aktiv bis: ${fmtDate(expiresAt)}`);
   };
 
   const onClear = async () => {
+    if (busy) return;
     await activation.clear();
     Alert.alert("Deaktiviert", "Lokale Aktivierung wurde gelöscht. App bleibt gesperrt.");
   };
@@ -188,28 +196,28 @@ export default function ActivationScreen() {
   return (
     <SafeAreaView style={styles.safe}>
       <View style={styles.wrap}>
-        <Text style={styles.h1}>Activation</Text>
+        <View style={styles.top}>
+          <BrandMark variant="combo" size="md" />
+          <Text style={styles.h1}>Aktivierung</Text>
+        </View>
 
         <View style={styles.card}>
           <Row label="Status" value={status} />
-          <Row label="Expires" value={fmtDate(activation.expiresAt)} />
-          <Row label="Key last4" value={activation.keyLast4 ?? "—"} />
-          <Row label="Tenant" value={settings.tenantSlug || "—"} />
-          <Row
-            label="Device"
-            value={settings.deviceUid ? settings.deviceUid.slice(0, 12) + "…" : "—"}
-            mono
-          />
+          <Row label="Gültig bis" value={fmtDate(activation.expiresAt)} />
+          <Row label="Key last4" value={activation.keyLast4 ?? "—"} mono />
+          <Row label="Tenant" value={settings.tenantSlug || "—"} mono />
+          <Row label="Device" value={settings.deviceUid ? settings.deviceUid.slice(0, 12) + "…" : "—"} mono />
         </View>
 
-        <Text style={styles.label}>License key</Text>
+        <Text style={styles.label}>Aktivierungscode</Text>
         <TextInput
           value={licenseKey}
           onChangeText={setLicenseKey}
           autoCapitalize="characters"
           placeholder="XXXX-XXXX-XXXX-XXXX"
           placeholderTextColor="#65758b"
-          style={styles.input}
+          style={[styles.input, busy && styles.inputDisabled]}
+          editable={!busy}
         />
 
         <Pressable
@@ -220,10 +228,10 @@ export default function ActivationScreen() {
           {busy ? (
             <View style={styles.busyRow}>
               <ActivityIndicator color="white" />
-              <Text style={styles.btnPrimaryText}>Activating…</Text>
+              <Text style={styles.btnPrimaryText}>Aktivieren…</Text>
             </View>
           ) : (
-            <Text style={styles.btnPrimaryText}>Activate</Text>
+            <Text style={styles.btnPrimaryText}>Lizenz aktivieren</Text>
           )}
         </Pressable>
 
@@ -236,15 +244,19 @@ export default function ActivationScreen() {
         ) : null}
 
         <View style={styles.actionsRow}>
-          <Pressable style={[styles.btn, styles.btnGhost]} onPress={() => nav.navigate("Settings")}>
-            <Text style={styles.btnGhostText}>Open Settings</Text>
+          <Pressable
+            style={[styles.btn, styles.btnGhost, busy && styles.btnDisabled]}
+            onPress={() => nav.navigate("Settings")}
+            disabled={busy}
+          >
+            <Text style={styles.btnGhostText}>Einstellungen</Text>
           </Pressable>
 
-          <Pressable style={[styles.btn, styles.btnGhost]} onPress={onDemo60}>
+          <Pressable style={[styles.btn, styles.btnGhost, busy && styles.btnDisabled]} onPress={onDemo60} disabled={busy}>
             <Text style={styles.btnGhostText}>Demo 60 min</Text>
           </Pressable>
 
-          <Pressable style={[styles.btn, styles.btnDanger]} onPress={onClear}>
+          <Pressable style={[styles.btn, styles.btnDanger, busy && styles.btnDisabled]} onPress={onClear} disabled={busy}>
             <Text style={styles.btnDangerText}>Deactivate / Clear (DEV)</Text>
           </Pressable>
         </View>
@@ -260,8 +272,8 @@ export default function ActivationScreen() {
 function Row({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <View style={styles.row}>
-      <Text style={styles.labelSmall}>{label}</Text>
-      <Text style={[styles.value, mono && styles.mono]} numberOfLines={1}>
+      <Text style={styles.rowLabel}>{label}</Text>
+      <Text style={[styles.rowValue, mono && styles.mono]} numberOfLines={1}>
         {value}
       </Text>
     </View>
@@ -270,56 +282,41 @@ function Row({ label, value, mono }: { label: string; value: string; mono?: bool
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: "white" },
-  wrap: { flex: 1, padding: 16, gap: 10 },
-  h1: { fontSize: 28, fontWeight: "800" },
+  wrap: { flex: 1, padding: 16, gap: 12 },
 
-  card: {
-    borderWidth: 1,
-    borderColor: "#e7e7ea",
-    borderRadius: 12,
-    padding: 12,
-    backgroundColor: "#fafafa",
-    gap: 8,
-  },
-  row: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 },
-  labelSmall: { fontSize: 12, color: "#667085" },
-  value: { fontSize: 13, color: "#111827", fontWeight: "700", flex: 1, textAlign: "right" },
-  mono: { fontFamily: "monospace", fontWeight: "500" },
+  top: { gap: 8, paddingTop: 4 },
+  h1: { fontSize: 26, fontWeight: "900" },
+
+  card: { borderWidth: 1, borderColor: "#e7e7ea", borderRadius: 12, padding: 12, backgroundColor: "#fafafa", gap: 8 },
+  row: { flexDirection: "row", justifyContent: "space-between", gap: 12 },
+  rowLabel: { fontSize: 12, color: "#667085" },
+  rowValue: { fontSize: 12, fontWeight: "800", color: "#111827", flex: 1, textAlign: "right" },
+  mono: { fontFamily: "monospace", fontWeight: "700" },
 
   label: { fontSize: 12, color: "#667085" },
-  input: {
-    borderWidth: 1,
-    borderColor: "#d0d5dd",
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontFamily: "monospace",
-  },
+  input: { borderWidth: 1, borderColor: "#d0d5dd", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10 },
+  inputDisabled: { opacity: 0.7 },
 
   btn: { paddingVertical: 12, paddingHorizontal: 14, borderRadius: 10, alignItems: "center" },
   btnPrimary: { backgroundColor: "#111827" },
-  btnPrimaryText: { color: "white", fontWeight: "800" },
-  btnDisabled: { opacity: 0.5 },
+  btnPrimaryText: { color: "white", fontWeight: "900" },
 
-  busyRow: { flexDirection: "row", alignItems: "center", gap: 10 },
-
-  actionsRow: { flexDirection: "row", gap: 10, flexWrap: "wrap" },
   btnGhost: { borderWidth: 1, borderColor: "#d0d5dd" },
-  btnGhostText: { color: "#111827", fontWeight: "800" },
+  btnGhostText: { color: "#111827", fontWeight: "900" },
 
   btnDanger: { borderWidth: 1, borderColor: "#fca5a5" },
   btnDangerText: { color: "#b91c1c", fontWeight: "900" },
 
-  errBox: {
-    borderWidth: 1,
-    borderColor: "#fecaca",
-    backgroundColor: "#fff1f2",
-    padding: 12,
-    borderRadius: 12,
-  },
-  errTitle: { fontWeight: "900", color: "#9f1239", marginBottom: 4 },
-  errText: { color: "#9f1239" },
-  errCode: { marginTop: 6, fontFamily: "monospace", color: "#9f1239" },
+  btnDisabled: { opacity: 0.55 },
 
-  foot: { marginTop: 6, fontSize: 12, color: "#667085" },
+  busyRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+
+  actionsRow: { marginTop: 6, flexDirection: "row", gap: 10, flexWrap: "wrap" },
+
+  errBox: { borderWidth: 1, borderColor: "#fecaca", borderRadius: 12, padding: 10, backgroundColor: "#fff1f2", gap: 4 },
+  errTitle: { fontWeight: "900", color: "#991b1b" },
+  errText: { color: "#7f1d1d" },
+  errCode: { color: "#7f1d1d", fontFamily: "monospace", fontWeight: "700" },
+
+  foot: { marginTop: 8, fontSize: 12, color: "#667085" },
 });
