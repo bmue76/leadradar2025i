@@ -15,11 +15,15 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useRoute } from "@react-navigation/native";
 import type { RouteProp } from "@react-navigation/native";
 
+import * as ImagePicker from "expo-image-picker";
+import * as FileSystem from "expo-file-system";
+import * as ImageManipulator from "expo-image-manipulator";
+
 import type { RootStackParamList } from "../navigation/types";
 import { useSettings } from "../storage/SettingsContext";
-import { mobileGetJson, mobilePostJson } from "../lib/mobileApi";
+import { mobileGetJson, mobilePostJson, mobilePostMultipart } from "../lib/mobileApi";
 import { uuidv4 } from "../lib/uuid";
-import { enqueueOutbox } from "../storage/outbox";
+import { enqueueOutbox, type PendingAttachment } from "../storage/outbox";
 import { loadFormDetailCache, saveFormDetailCache } from "../storage/formsCache";
 import { DEMO_FORM_ID, getDemoFormDetail } from "../lib/demoForms";
 
@@ -91,6 +95,59 @@ function fieldKey(f: MobileFormField) {
   return (f.key && String(f.key)) || String(f.id);
 }
 
+function basenameFromUri(uri: string): string {
+  try {
+    const clean = uri.split("?")[0] || uri;
+    const parts = clean.split("/").filter(Boolean);
+    return parts[parts.length - 1] || "card.jpg";
+  } catch {
+    return "card.jpg";
+  }
+}
+
+function ensureJpgName(name: string) {
+  const n = name.trim() || "card.jpg";
+  return /\.(jpe?g)$/i.test(n) ? n : `${n}.jpg`;
+}
+
+async function deleteLocalFile(uri: string) {
+  try {
+    await (FileSystem as any).deleteAsync(uri, { idempotent: true });
+  } catch {
+    // ignore
+  }
+}
+
+async function copyIntoAppStorage(srcUri: string, filename: string): Promise<string> {
+  const baseDir =
+    (FileSystem as any).documentDirectory ||
+    (FileSystem as any).cacheDirectory ||
+    null;
+
+  if (!baseDir) {
+    // fallback: keep original uri
+    return srcUri;
+  }
+
+  const dir = `${baseDir}lr_attachments/`;
+  try {
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+  } catch {
+    // ignore
+  }
+
+  const id = await uuidv4();
+  const safe = ensureJpgName(filename).replace(/[/\\]/g, "_").replace(/\s+/g, "_");
+  const dst = `${dir}${id}_${safe}`;
+
+  try {
+    await FileSystem.copyAsync({ from: srcUri, to: dst });
+    return dst;
+  } catch {
+    return srcUri;
+  }
+}
+
 export default function CaptureScreen() {
   const route = useRoute<R>();
   const { formId, formName } = route.params;
@@ -104,6 +161,10 @@ export default function CaptureScreen() {
 
   const [form, setForm] = useState<MobileFormDetail | null>(null);
   const [values, setValues] = useState<Record<string, any>>({});
+
+  // NEW: business card scan (required for “Visitenkarten-Scan”-Process)
+  const [card, setCard] = useState<PendingAttachment | null>(null);
+  const [cardBusy, setCardBusy] = useState(false);
 
   // For demo form we do NOT require baseUrl (offline-first)
   const canLoad = useMemo(() => isLoaded && !!tenantSlug && !!formId, [isLoaded, tenantSlug, formId]);
@@ -292,6 +353,87 @@ export default function CaptureScreen() {
     return missing;
   }
 
+  async function pickBusinessCard(source: "camera" | "library") {
+    setCardBusy(true);
+    setError(null);
+    setInfo(null);
+
+    try {
+      if (source === "camera") {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("Kamera nicht erlaubt", "Bitte Kamera-Berechtigung erlauben.");
+          return;
+        }
+      } else {
+        const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert("Galerie nicht erlaubt", "Bitte Medien-Berechtigung erlauben.");
+          return;
+        }
+      }
+
+      const res =
+        source === "camera"
+          ? await ImagePicker.launchCameraAsync({
+              mediaTypes: ImagePicker.MediaTypeOptions.Images,
+              quality: 0.35, // MVP: klein halten (≈ “150dpi reicht” -> niedrige Größe)
+              allowsEditing: false,
+              exif: false,
+            })
+          : await ImagePicker.launchImageLibraryAsync({
+              mediaTypes: ImagePicker.MediaTypeOptions.Images,
+              quality: 0.35,
+              allowsEditing: false,
+              exif: false,
+            });
+
+      if (res.canceled) return;
+      const asset = res.assets?.[0];
+      if (!asset?.uri) return;
+
+      // MVP: downscale (pixel) + compress. (SW/grayscale machen wir später serverseitig, falls nötig.)
+      let finalUri = asset.uri;
+      try {
+        const manipulated = await ImageManipulator.manipulateAsync(
+          asset.uri,
+          [{ resize: { width: Math.min(1100, asset.width || 1100) } }],
+          { compress: 0.35, format: ImageManipulator.SaveFormat.JPEG }
+        );
+        if (manipulated?.uri) finalUri = manipulated.uri;
+      } catch {
+        // ignore (keep original)
+      }
+
+      const filename = ensureJpgName(asset.fileName || basenameFromUri(finalUri) || "businesscard.jpg");
+      const storedUri = await copyIntoAppStorage(finalUri, filename);
+
+      const now = new Date().toISOString();
+      const att: PendingAttachment = {
+        id: await uuidv4(),
+        type: "IMAGE",
+        filename,
+        mimeType: "image/jpeg",
+        localUri: storedUri,
+        status: "PENDING",
+        createdAt: now,
+        tries: 0,
+      };
+
+      setCard(att);
+      setInfo("Visitenkarte bereit. Wird beim Speichern mitgesendet. ✅");
+    } catch (e: any) {
+      setError(e?.message ? String(e.message) : "Visitenkarte konnte nicht erfasst werden.");
+    } finally {
+      setCardBusy(false);
+    }
+  }
+
+  async function removeCard() {
+    if (card?.localUri) await deleteLocalFile(card.localUri);
+    setCard(null);
+  }
+
   async function onSaveLead() {
     if (!form) return;
     if (!tenantSlug) {
@@ -305,12 +447,18 @@ export default function CaptureScreen() {
       return;
     }
 
+    // Process: with business-card scan, an image is ALWAYS included
+    if (!card) {
+      Alert.alert("Visitenkarte fehlt", "Bitte zuerst eine Visitenkarte aufnehmen oder aus der Galerie wählen.");
+      return;
+    }
+
     setSaving(true);
     setError(null);
     setInfo(null);
 
     const clientLeadId = await uuidv4();
-    const payload = {
+    const leadPayload = {
       formId: form.id,
       clientLeadId,
       values,
@@ -320,18 +468,33 @@ export default function CaptureScreen() {
     try {
       if (!baseUrl) throw new Error("No baseUrl");
 
-      const res = await mobilePostJson<any>({
+      // Send as multipart lead+scan
+      await mobilePostMultipart({
         baseUrl,
         tenantSlug,
         path: "/api/mobile/v1/leads",
-        body: payload,
+        timeoutMs: 15000,
+        fields: {
+          payload: JSON.stringify(leadPayload),
+          type: "IMAGE",
+        },
+        file: {
+          uri: card.localUri,
+          name: card.filename,
+          mimeType: card.mimeType || "image/jpeg",
+        },
       });
 
-      const created = typeof res?.created === "boolean" ? res.created : undefined;
-      setInfo(created === false ? "Lead already existed (idempotent). ✅" : "Lead saved. ✅");
+      setInfo("Lead + Visitenkarte gespeichert. ✅");
       resetValues();
+
+      // cleanup local card file after successful upload
+      if (card.localUri) await deleteLocalFile(card.localUri);
+      setCard(null);
     } catch (e: any) {
       const msg = e?.message ? String(e.message) : "Save failed, queued.";
+
+      // Queue in outbox WITH pending attachment
       await enqueueOutbox({
         id: await uuidv4(),
         createdAt: new Date().toISOString(),
@@ -341,10 +504,21 @@ export default function CaptureScreen() {
         values,
         tries: 0,
         lastError: msg,
+        attachments: [
+          {
+            ...card,
+            status: "PENDING",
+            tries: card.tries ?? 0,
+            lastError: msg,
+          },
+        ],
       });
 
-      setInfo("Offline/failed → queued in Outbox. ⏳");
+      setInfo("Offline/failed → Lead + Visitenkarte in Outbox. ⏳");
       resetValues();
+
+      // keep UI clean for next lead (file stays in app storage for later sync)
+      setCard(null);
     } finally {
       setSaving(false);
     }
@@ -521,17 +695,66 @@ export default function CaptureScreen() {
               <Text style={styles.hint}>No form loaded.</Text>
             ) : (
               <>
+                {/* Business card scan (required) */}
+                <View style={styles.cardBox}>
+                  <Text style={styles.cardTitle}>Visitenkarte (Scan)</Text>
+                  <Text style={styles.cardText}>
+                    Prozess: Bei jedem Lead wird ein Visitenkarten-Abbild mitgesendet (MVP: komprimiertes JPG).
+                  </Text>
+
+                  {card ? (
+                    <View style={{ gap: 6 }}>
+                      <Text style={styles.cardMeta}>
+                        Datei: <Text style={styles.mono}>{card.filename}</Text>
+                      </Text>
+                      <Text style={styles.cardMeta}>
+                        Zeitpunkt: <Text style={styles.mono}>{card.createdAt}</Text>
+                      </Text>
+                      <Text style={styles.cardMeta}>
+                        Status: <Text style={styles.mono}>bereit</Text>
+                      </Text>
+
+                      <View style={styles.actionsRow}>
+                        <Pressable onPress={removeCard} style={styles.btnDangerSmall}>
+                          <Text style={styles.btnDangerSmallText}>Entfernen</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                  ) : (
+                    <View style={styles.actionsRow}>
+                      <Pressable
+                        onPress={() => pickBusinessCard("camera")}
+                        style={[styles.btnPrimary, cardBusy ? { opacity: 0.6 } : null]}
+                        disabled={cardBusy}
+                      >
+                        <Text style={styles.btnPrimaryText}>{cardBusy ? "…" : "Foto aufnehmen"}</Text>
+                      </Pressable>
+
+                      <Pressable
+                        onPress={() => pickBusinessCard("library")}
+                        style={[styles.btnGhost, cardBusy ? { opacity: 0.6 } : null]}
+                        disabled={cardBusy}
+                      >
+                        <Text style={styles.btnGhostText}>{cardBusy ? "…" : "Aus Galerie"}</Text>
+                      </Pressable>
+                    </View>
+                  )}
+                </View>
+
                 {fields.map(renderField)}
 
                 <View style={styles.footerCard}>
                   <Text style={styles.footerTitle}>Save Lead</Text>
-                  <Text style={styles.footerText}>Online: POST lead. Offline/fail: queued to Outbox.</Text>
+                  <Text style={styles.footerText}>Online: multipart Lead + Visitenkarte. Offline/fail: queued to Outbox.</Text>
+
                   <Pressable
-                    style={[styles.btnPrimary, saving ? { opacity: 0.6 } : null]}
+                    style={[styles.btnPrimary, (saving || !card) ? { opacity: 0.6 } : null]}
                     onPress={onSaveLead}
-                    disabled={saving}
+                    disabled={saving || !card}
                   >
-                    <Text style={styles.btnPrimaryText}>{saving ? "Saving…" : "Save Lead"}</Text>
+                    <Text style={styles.btnPrimaryText}>
+                      {saving ? "Saving…" : !card ? "Visitenkarte erforderlich" : "Save Lead"}
+                    </Text>
                   </Pressable>
                 </View>
               </>
@@ -553,7 +776,7 @@ const styles = StyleSheet.create({
   topSub: { color: "#555" },
   mono: { fontFamily: "monospace" },
 
-  actionsRow: { marginTop: 6, flexDirection: "row", gap: 10, alignItems: "center" },
+  actionsRow: { marginTop: 6, flexDirection: "row", gap: 10, alignItems: "center", flexWrap: "wrap" },
   btnGhost: {
     borderWidth: 1,
     borderColor: "#ddd",
@@ -600,4 +823,12 @@ const styles = StyleSheet.create({
 
   btnPrimary: { backgroundColor: "#111", paddingHorizontal: 14, paddingVertical: 12, borderRadius: 10 },
   btnPrimaryText: { color: "#fff", fontWeight: "800" },
+
+  cardBox: { borderWidth: 1, borderColor: "#eee", borderRadius: 12, padding: 12, gap: 8 },
+  cardTitle: { fontSize: 16, fontWeight: "900" },
+  cardText: { color: "#555" },
+  cardMeta: { color: "#444" },
+
+  btnDangerSmall: { borderWidth: 1, borderColor: "#b00020", paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
+  btnDangerSmallText: { color: "#b00020", fontWeight: "900" },
 });

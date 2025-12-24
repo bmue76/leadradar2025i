@@ -1,7 +1,15 @@
 import { DeviceEventEmitter } from "react-native";
-import { mobilePostJson } from "../lib/mobileApi";
+import * as FileSystem from "expo-file-system";
+
+import { mobilePostJson, mobilePostMultipart } from "../lib/mobileApi";
 import { DEMO_FORM_ID } from "../lib/demoForms";
-import { loadOutbox, removeOutboxItem, updateOutboxItem, type OutboxItem } from "../storage/outbox";
+import {
+  loadOutbox,
+  removeOutboxItem,
+  updateOutboxItem,
+  type OutboxItem,
+  type PendingAttachment,
+} from "../storage/outbox";
 
 export const OUTBOX_SYNC_STATUS_EVENT = "leadradar:outboxSyncStatus";
 
@@ -35,6 +43,35 @@ function emitStatus(payload: OutboxSyncStatus) {
 
 function isDemoLead(item: OutboxItem) {
   return item.formId === DEMO_FORM_ID || item.formId.startsWith("demo-");
+}
+
+function firstPendingAttachment(item: OutboxItem): PendingAttachment | null {
+  const list = Array.isArray(item.attachments) ? item.attachments : [];
+  for (const a of list) {
+    if (!a) continue;
+    if (a.status === "UPLOADED") continue;
+    if (!a.localUri || !a.filename || !a.mimeType) continue;
+    return a;
+  }
+  return null;
+}
+
+async function localFileExists(uri: string): Promise<boolean> {
+  try {
+    const info = await FileSystem.getInfoAsync(uri);
+    return !!(info as any)?.exists;
+  } catch {
+    return false;
+  }
+}
+
+async function deleteLocalFile(uri: string) {
+  try {
+    // idempotent is not always typed in older SDKs → any
+    await (FileSystem as any).deleteAsync(uri, { idempotent: true });
+  } catch {
+    // ignore
+  }
 }
 
 /**
@@ -119,7 +156,65 @@ export async function syncOutboxNow(args: {
         continue;
       }
 
+      const att = firstPendingAttachment(item);
+
       try {
+        // If we have a pending card, send Lead as multipart (payload + file)
+        if (att) {
+          const exists = await localFileExists(att.localUri);
+          if (!exists) {
+            failed += 1;
+
+            const nextAttachments = (item.attachments ?? []).map((a) =>
+              a.id === att.id
+                ? {
+                    ...a,
+                    status: "FAILED" as const,
+                    tries: (a.tries ?? 0) + 1,
+                    lastError: "Local attachment file missing.",
+                  }
+                : a
+            );
+
+            await updateOutboxItem(item.id, {
+              tries: (item.tries ?? 0) + 1,
+              lastError: "Local attachment file missing.",
+              attachments: nextAttachments,
+            });
+            continue;
+          }
+
+          await mobilePostMultipart({
+            baseUrl: args.baseUrl,
+            tenantSlug: args.tenantSlug,
+            path: "/api/mobile/v1/leads",
+            timeoutMs: Math.max(timeoutMs, 15000),
+            fields: {
+              payload: JSON.stringify({
+                formId: item.formId,
+                clientLeadId: item.clientLeadId,
+                values: item.values,
+                capturedByDeviceUid: item.capturedByDeviceUid,
+              }),
+              type: att.type || "IMAGE",
+            },
+            file: {
+              uri: att.localUri,
+              name: att.filename,
+              mimeType: att.mimeType,
+            },
+          });
+
+          ok += 1;
+
+          // optional: cleanup local file when synced successfully
+          await deleteLocalFile(att.localUri);
+
+          await removeOutboxItem(item.id);
+          continue;
+        }
+
+        // Otherwise: classic JSON lead sync
         await mobilePostJson({
           baseUrl: args.baseUrl,
           tenantSlug: args.tenantSlug,
@@ -138,9 +233,26 @@ export async function syncOutboxNow(args: {
       } catch (e: any) {
         failed += 1;
         const msg = e?.message ? String(e.message) : "Sync failed";
+
+        // If attachment exists: mark it FAILED (keep queued)
+        let nextAttachments = item.attachments;
+        if (att && Array.isArray(item.attachments)) {
+          nextAttachments = item.attachments.map((a) =>
+            a.id === att.id
+              ? {
+                  ...a,
+                  status: "FAILED" as const,
+                  tries: (a.tries ?? 0) + 1,
+                  lastError: msg,
+                }
+              : a
+          );
+        }
+
         await updateOutboxItem(item.id, {
           tries: (item.tries ?? 0) + 1,
           lastError: msg,
+          attachments: nextAttachments,
         });
       }
     }

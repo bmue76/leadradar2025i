@@ -5,6 +5,12 @@ type MobileRequest = {
   timeoutMs?: number;
 };
 
+type MultipartFile = {
+  uri: string;
+  name: string;
+  mimeType: string;
+};
+
 function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.replace(/\/+$/, "");
 }
@@ -56,9 +62,7 @@ export async function mobileGetJson<T = any>(req: MobileRequest): Promise<T> {
   const data = await parseJsonSafe(res);
 
   if (!res.ok) {
-    const msg =
-      (data && (data.message || data.error || data.code)) ||
-      `HTTP ${res.status} on GET ${req.path}`;
+    const msg = (data && (data.message || data.error || data.code)) || `HTTP ${res.status} on GET ${req.path}`;
     throw new Error(String(msg));
   }
 
@@ -87,9 +91,62 @@ export async function mobilePostJson<T = any>(req: MobileRequest & { body: any }
   const data = await parseJsonSafe(res);
 
   if (!res.ok) {
-    const msg =
-      (data && (data.message || data.error || data.code)) ||
-      `HTTP ${res.status} on POST ${req.path}`;
+    const msg = (data && (data.message || data.error || data.code)) || `HTTP ${res.status} on POST ${req.path}`;
+    throw new Error(String(msg));
+  }
+
+  return data as T;
+}
+
+/**
+ * Multipart POST helper (MVP)
+ * - Sends fields as string parts
+ * - Sends one file part as `file`
+ * - DO NOT set Content-Type manually (fetch sets boundary)
+ */
+export async function mobilePostMultipart<T = any>(
+  req: MobileRequest & {
+    fields?: Record<string, string>;
+    file: MultipartFile;
+  }
+): Promise<T> {
+  const base = normalizeBaseUrl(req.baseUrl);
+  const url = `${base}${req.path}`;
+  const timeoutMs = typeof req.timeoutMs === "number" ? req.timeoutMs : 15000;
+
+  const fd: any = new FormData();
+
+  if (req.fields) {
+    for (const [k, v] of Object.entries(req.fields)) {
+      fd.append(k, String(v));
+    }
+  }
+
+  // React Native / Expo: file must be { uri, name, type }
+  fd.append("file", {
+    uri: req.file.uri,
+    name: req.file.name,
+    type: req.file.mimeType,
+  } as any);
+
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "x-tenant-slug": req.tenantSlug,
+        // ⚠️ no Content-Type here (boundary)
+      } as any,
+      body: fd,
+    },
+    timeoutMs
+  );
+
+  const data = await parseJsonSafe(res);
+
+  if (!res.ok) {
+    const msg = (data && (data.message || data.error || data.code)) || `HTTP ${res.status} on POST ${req.path}`;
     throw new Error(String(msg));
   }
 

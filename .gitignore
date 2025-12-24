@@ -43,3 +43,6 @@ yarn-error.log*
 .tmp_*.csv
 .tmp_*.txt
 .tmp_exports/
+
+# LeadRadar local uploads (dev)
+.tmp_uploads/
