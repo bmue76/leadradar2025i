@@ -1,15 +1,27 @@
 // app/api/mobile/v1/leads/[id]/attachments/route.ts
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 import { jsonOk, jsonError } from "@/lib/api";
 import { resolveTenantFromMobileHeaders } from "@/lib/tenant-mobile";
 import { prisma } from "@/lib/db";
-import type { LeadAttachmentType } from "@prisma/client";
+import type { LeadAttachmentType, Prisma } from "@prisma/client";
 
 export const runtime = "nodejs";
 
 const ALLOWED_TYPES: LeadAttachmentType[] = ["IMAGE", "PDF", "OTHER"];
+
+// MVP safety limit (card scan should be small)
+const MAX_BYTES = 2_500_000; // 2.5 MB
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
 
 function safeFilename(s: string): string {
   return s
@@ -20,9 +32,33 @@ function safeFilename(s: string): string {
     .slice(0, 120);
 }
 
-function leadIdFromCtxOrUrl(req: Request, ctx?: { params?: { id?: string } }): string {
-  const fromCtx = ctx?.params?.id;
-  if (typeof fromCtx === "string" && fromCtx.trim()) return fromCtx.trim();
+function getExtFromMime(mime: string | null | undefined): string {
+  const m = (mime || "").toLowerCase();
+  if (m === "image/png") return ".png";
+  if (m === "image/jpeg" || m === "image/jpg") return ".jpg";
+  if (m === "image/webp") return ".webp";
+  if (m === "application/pdf") return ".pdf";
+  return "";
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+  // Use Uint8Array (ArrayBufferView) to avoid Buffer typing conflicts
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * Next.js can deliver ctx.params as a Promise ("sync dynamic apis").
+ * Robust async unwrap + URL fallback.
+ */
+async function leadIdFromCtxOrUrl(req: Request, ctx?: any): Promise<string> {
+  try {
+    const p = ctx?.params;
+    const params = p && typeof p.then === "function" ? await p : p;
+    const id = params?.id;
+    if (isNonEmptyString(id)) return id.trim();
+  } catch {
+    // ignore
+  }
 
   // Fallback: /api/mobile/v1/leads/{id}/attachments
   try {
@@ -33,65 +69,94 @@ function leadIdFromCtxOrUrl(req: Request, ctx?: { params?: { id?: string } }): s
   } catch {
     // ignore
   }
+
   return "";
 }
 
-export async function POST(req: Request, ctx: { params?: { id?: string } }) {
+/**
+ * role semantics (MVP):
+ * - role=BUSINESS_CARD => mark lead.meta.card.present=true
+ * - if role missing and type=IMAGE => treat as BUSINESS_CARD (because card scan is always sent)
+ */
+function normalizeRole(v: unknown): string | null {
+  if (!isNonEmptyString(v)) return null;
+  const t = v.trim().toUpperCase();
+  return t ? t : null;
+}
+
+export async function POST(req: Request, ctx: any) {
   const tenantRes = await resolveTenantFromMobileHeaders(prisma, req.headers);
-  if (!tenantRes.ok) {
+  if (tenantRes.ok !== true) {
     return jsonError(req, tenantRes.status, tenantRes.code, tenantRes.message);
   }
-  // TS narrowing helper (TenantResolveResult is not discriminated well)
-  const tenant = (tenantRes as any).tenant as { id: string };
+  const tenantId = tenantRes.tenant.id;
 
-  const leadId = leadIdFromCtxOrUrl(req, ctx);
+  const leadId = await leadIdFromCtxOrUrl(req, ctx);
   if (!leadId) {
     return jsonError(req, 400, "INVALID_PARAMS", "Missing lead id.");
   }
 
-  // leak-safe: lead must belong to tenant
   const lead = await prisma.lead.findFirst({
-    where: { id: leadId, tenantId: tenant.id },
-    select: { id: true },
+    where: { id: leadId, tenantId },
+    select: { id: true, meta: true },
   });
+  if (!lead) return jsonError(req, 404, "NOT_FOUND", "Lead not found.");
 
-  if (!lead) {
-    return jsonError(req, 404, "NOT_FOUND", "Lead not found.");
-  }
-
-  let formData: any;
+  // IMPORTANT: do not type this as FormData -> avoids TS FormData mismatch errors
+  let fd: any;
   try {
-    formData = await req.formData();
+    fd = await req.formData();
   } catch {
-    return jsonError(req, 400, "BAD_MULTIPART", "Expected multipart/form-data.");
+    return jsonError(req, 400, "BAD_REQUEST", "Expected multipart/form-data.");
   }
 
-  const file = formData.get("file");
-  if (!(file instanceof File)) {
-    return jsonError(req, 400, "FILE_REQUIRED", "file is required.");
+  const typeRaw = fd.get("type");
+  const type = isNonEmptyString(typeRaw) ? typeRaw.trim().toUpperCase() : "";
+  if (!type || !ALLOWED_TYPES.includes(type as LeadAttachmentType)) {
+    return jsonError(req, 400, "BAD_REQUEST", `type must be one of: ${ALLOWED_TYPES.join(", ")}`);
   }
 
-  const typeRaw = formData.get("type");
-  const typeStr = typeof typeRaw === "string" ? typeRaw.trim() : "";
-  const type = (typeStr || "OTHER") as LeadAttachmentType;
+  const roleRaw = normalizeRole(fd.get("role"));
+  const effectiveRole = roleRaw ?? (type === "IMAGE" ? "BUSINESS_CARD" : null);
 
-  if (!ALLOWED_TYPES.includes(type)) {
-    return jsonError(req, 400, "BAD_TYPE", `type must be one of: ${ALLOWED_TYPES.join(", ")}.`);
+  const file = fd.get("file");
+  if (!file || typeof file !== "object" || typeof (file as any).arrayBuffer !== "function") {
+    return jsonError(req, 400, "BAD_REQUEST", "Missing file.");
   }
 
-  const filename = file.name ? safeFilename(file.name) : null;
-  const mimeType = file.type || null;
-  const sizeBytes = Number.isFinite((file as any).size) ? Number((file as any).size) : null;
+  const maybeName = (file as any).name;
+  const maybeType = (file as any).type;
 
-  // Create DB record first to obtain attachmentId
+  const filename = isNonEmptyString(maybeName) ? safeFilename(maybeName) : "upload";
+  const mimeType = isNonEmptyString(maybeType) ? String(maybeType) : null;
+
+  let ab: ArrayBuffer;
+  try {
+    ab = await (file as any).arrayBuffer();
+  } catch {
+    return jsonError(req, 400, "BAD_REQUEST", "Unable to read file bytes.");
+  }
+
+  const bytes = new Uint8Array(ab);
+
+  if (!bytes.length) return jsonError(req, 400, "BAD_REQUEST", "Empty file.");
+  if (bytes.length > MAX_BYTES) {
+    return jsonError(req, 413, "PAYLOAD_TOO_LARGE", `File too large (max ${MAX_BYTES} bytes).`);
+  }
+
+  const checksum = sha256Hex(bytes);
+  const now = new Date();
+
+  // Create DB row first (we want attachment id for storageKey naming)
   const created = await prisma.leadAttachment.create({
     data: {
-      tenantId: tenant.id,
+      tenantId,
       leadId: lead.id,
-      type,
+      type: type as LeadAttachmentType,
       filename,
       mimeType,
-      sizeBytes,
+      sizeBytes: bytes.length,
+      checksum,
       storageKey: null,
       url: null,
     },
@@ -101,61 +166,77 @@ export async function POST(req: Request, ctx: { params?: { id?: string } }) {
       filename: true,
       mimeType: true,
       sizeBytes: true,
+      checksum: true,
       storageKey: true,
       url: true,
       createdAt: true,
     },
   });
 
-  // Local storage stub
-  try {
-    const baseDir = path.join(process.cwd(), ".tmp_uploads", tenant.id, lead.id);
-    fs.mkdirSync(baseDir, { recursive: true });
+  // Write local file (MVP storage stub)
+  const ext =
+    path.extname(filename) ||
+    getExtFromMime(mimeType) ||
+    (type === "PDF" ? ".pdf" : type === "IMAGE" ? ".png" : "");
 
-    const namePart = filename ? safeFilename(filename) : "upload.bin";
-    const diskName = `${created.id}_${namePart}`;
-    const absPath = path.join(baseDir, diskName);
+  const baseName = safeFilename(path.basename(filename, path.extname(filename)) || "file");
+  const fileNameOnDisk = `${created.id}_${baseName}${ext}`;
 
-    // Use Uint8Array to avoid Buffer typing issues
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    fs.writeFileSync(absPath, bytes);
+  const dir = path.join(process.cwd(), ".tmp_uploads", tenantId, lead.id);
+  fs.mkdirSync(dir, { recursive: true });
 
-    const storageKey = path
-      .join(".tmp_uploads", tenant.id, lead.id, diskName)
-      .replace(/\\/g, "/");
+  const absPath = path.join(dir, fileNameOnDisk);
+  // Use Uint8Array to avoid Buffer typing conflicts
+  fs.writeFileSync(absPath, bytes);
 
-    const updated = await prisma.leadAttachment.update({
-      where: { id: created.id },
-      data: { storageKey },
-      select: {
-        id: true,
-        type: true,
-        filename: true,
-        mimeType: true,
-        sizeBytes: true,
-        storageKey: true,
-        url: true,
-        createdAt: true,
-      },
-    });
+  const storageKey = path
+    .join(".tmp_uploads", tenantId, lead.id, fileNameOnDisk)
+    .replace(/\\/g, "/");
 
-    return jsonOk(req, {
-      id: updated.id,
-      type: updated.type,
-      filename: updated.filename,
-      mimeType: updated.mimeType,
-      sizeBytes: updated.sizeBytes,
-      storageKey: updated.storageKey,
-      url: updated.url,
-      createdAt: updated.createdAt.toISOString(),
-    });
-  } catch (e: any) {
-    // Best effort cleanup
+  const updated = await prisma.leadAttachment.update({
+    where: { id: created.id },
+    data: { storageKey },
+    select: {
+      id: true,
+      type: true,
+      filename: true,
+      mimeType: true,
+      sizeBytes: true,
+      checksum: true,
+      storageKey: true,
+      url: true,
+      createdAt: true,
+    },
+  });
+
+  // If this is the mandatory business card snapshot, mark lead.meta.card.present=true
+  const isBusinessCard = type === "IMAGE" && effectiveRole === "BUSINESS_CARD";
+
+  if (isBusinessCard) {
+    const meta0 = lead.meta;
+    const nextMeta: Record<string, any> = isPlainObject(meta0) ? { ...(meta0 as any) } : {};
+    const card0 = isPlainObject(nextMeta.card) ? { ...nextMeta.card } : {};
+
+    nextMeta.card = {
+      ...card0,
+      required: true,
+      present: true,
+      attachmentId: updated.id,
+      filename: updated.filename ?? null,
+      mimeType: updated.mimeType ?? null,
+      sizeBytes: updated.sizeBytes ?? null,
+      updatedAt: now.toISOString(),
+    };
+
     try {
-      await prisma.leadAttachment.delete({ where: { id: created.id } });
+      await prisma.lead.update({
+        where: { id: lead.id },
+        data: { meta: nextMeta as Prisma.InputJsonValue },
+      });
     } catch {
-      // ignore
+      // ignore (best effort)
     }
-    return jsonError(req, 500, "STORAGE_FAILED", String(e?.message || "Failed to store file."));
   }
+
+  return jsonOk(req, { ...updated, role: effectiveRole });
 }
