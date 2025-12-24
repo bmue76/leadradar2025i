@@ -1,7 +1,7 @@
 import { DeviceEventEmitter } from "react-native";
 import * as FileSystem from "expo-file-system";
 
-import { mobilePostJson, mobilePostMultipart } from "../lib/mobileApi";
+import { mobilePostJson } from "../lib/mobileApi";
 import { DEMO_FORM_ID } from "../lib/demoForms";
 import {
   loadOutbox,
@@ -67,11 +67,19 @@ async function localFileExists(uri: string): Promise<boolean> {
 
 async function deleteLocalFile(uri: string) {
   try {
-    // idempotent is not always typed in older SDKs → any
     await (FileSystem as any).deleteAsync(uri, { idempotent: true });
   } catch {
     // ignore
   }
+}
+
+async function readBase64(uri: string): Promise<string> {
+  // ✅ Keine EncodingType Referenz (TS-safe in allen Expo-Versionen)
+  const b64 = await FileSystem.readAsStringAsync(
+    uri,
+    { encoding: "base64" as any } as any
+  );
+  return String(b64 || "");
 }
 
 /**
@@ -92,24 +100,12 @@ export async function syncOutboxNow(args: {
 
   if (__syncMutex) {
     emitStatus({ syncing: false, skipped: 1, skippedReason: "busy", reason, finishedAt });
-    return {
-      ok: 0,
-      failed: 0,
-      skipped: 1,
-      message: "Sync skipped (busy)",
-      finishedAt,
-    };
+    return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (busy)", finishedAt };
   }
 
   if (args.isOnline === false) {
     emitStatus({ syncing: false, skipped: 1, skippedReason: "offline", reason, finishedAt });
-    return {
-      ok: 0,
-      failed: 0,
-      skipped: 1,
-      message: "Sync skipped (offline)",
-      finishedAt,
-    };
+    return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (offline)", finishedAt };
   }
 
   if (!args.baseUrl || !args.tenantSlug) {
@@ -137,17 +133,10 @@ export async function syncOutboxNow(args: {
     if (!current.length) {
       const fin = new Date().toISOString();
       emitStatus({ syncing: false, reason, startedAt, finishedAt: fin, skipped: 1, skippedReason: "empty" });
-      return {
-        ok: 0,
-        failed: 0,
-        skipped: 1,
-        message: "Outbox empty (nothing to sync).",
-        finishedAt: fin,
-      };
+      return { ok: 0, failed: 0, skipped: 1, message: "Outbox empty (nothing to sync).", finishedAt: fin };
     }
 
     for (const item of current) {
-      // Demo items are local-only; backend can't accept them.
       if (isDemoLead(item)) {
         skipped += 1;
         await updateOutboxItem(item.id, {
@@ -159,7 +148,7 @@ export async function syncOutboxNow(args: {
       const att = firstPendingAttachment(item);
 
       try {
-        // If we have a pending card, send Lead as multipart (payload + file)
+        // Prefer: if pending attachment exists -> send inline base64 (server accepts it)
         if (att) {
           const exists = await localFileExists(att.localUri);
           if (!exists) {
@@ -184,37 +173,34 @@ export async function syncOutboxNow(args: {
             continue;
           }
 
-          await mobilePostMultipart({
+          const base64 = await readBase64(att.localUri);
+
+          await mobilePostJson({
             baseUrl: args.baseUrl,
             tenantSlug: args.tenantSlug,
             path: "/api/mobile/v1/leads",
             timeoutMs: Math.max(timeoutMs, 15000),
-            fields: {
-              payload: JSON.stringify({
-                formId: item.formId,
-                clientLeadId: item.clientLeadId,
-                values: item.values,
-                capturedByDeviceUid: item.capturedByDeviceUid,
-              }),
-              type: att.type || "IMAGE",
-            },
-            file: {
-              uri: att.localUri,
-              name: att.filename,
-              mimeType: att.mimeType,
+            body: {
+              formId: item.formId,
+              clientLeadId: item.clientLeadId,
+              values: item.values,
+              capturedByDeviceUid: item.capturedByDeviceUid,
+              cardImageBase64: base64,
+              cardImageMimeType: att.mimeType,
+              cardImageFilename: att.filename,
             },
           });
 
           ok += 1;
 
-          // optional: cleanup local file when synced successfully
+          // cleanup local file when synced successfully
           await deleteLocalFile(att.localUri);
 
           await removeOutboxItem(item.id);
           continue;
         }
 
-        // Otherwise: classic JSON lead sync
+        // Fallback: classic JSON lead sync without card
         await mobilePostJson({
           baseUrl: args.baseUrl,
           tenantSlug: args.tenantSlug,
@@ -270,13 +256,7 @@ export async function syncOutboxNow(args: {
     const fin = new Date().toISOString();
     const msg = e?.message ? String(e.message) : "Sync error";
     emitStatus({ syncing: false, reason, startedAt, finishedAt: fin, ok, failed, skipped, error: msg });
-    return {
-      ok,
-      failed: failed + 1,
-      skipped,
-      message: `Sync error: ${msg}`,
-      finishedAt: fin,
-    };
+    return { ok, failed: failed + 1, skipped, message: `Sync error: ${msg}`, finishedAt: fin };
   } finally {
     __syncMutex = false;
   }
