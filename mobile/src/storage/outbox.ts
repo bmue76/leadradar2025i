@@ -1,3 +1,5 @@
+//mobile/src/storage/outbox.ts
+
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const KEY_OUTBOX = "lr:outbox";
@@ -5,6 +7,11 @@ const KEY_OUTBOX = "lr:outbox";
 export type PendingAttachmentType = "IMAGE" | "PDF" | "OTHER";
 export type PendingAttachmentStatus = "PENDING" | "UPLOADED" | "FAILED";
 
+/**
+ * Legacy / optional:
+ * - We keep this for backward compatibility (older queued items)
+ * - New flow stores card as cardImageBase64 instead of localUri file.
+ */
 export type PendingAttachment = {
   id: string;
   createdAt: string;
@@ -39,7 +46,12 @@ export type OutboxItem = {
   tries: number;
   lastError?: string;
 
-  // NEW (3.4B): optional attachments queue
+  // NEW: card inline (preferred)
+  cardImageBase64?: string;
+  cardImageMimeType?: string;
+  cardImageFilename?: string;
+
+  // Legacy/optional queue (kept for compatibility)
   attachments?: PendingAttachment[];
 };
 
@@ -57,6 +69,10 @@ function normalizeItem(raw: any): OutboxItem | null {
   const tries = typeof raw.tries === "number" ? raw.tries : 0;
   const lastError = typeof raw.lastError === "string" ? raw.lastError : undefined;
   const capturedByDeviceUid = typeof raw.capturedByDeviceUid === "string" ? raw.capturedByDeviceUid : undefined;
+
+  const cardImageBase64 = typeof raw.cardImageBase64 === "string" ? raw.cardImageBase64 : undefined;
+  const cardImageMimeType = typeof raw.cardImageMimeType === "string" ? raw.cardImageMimeType : undefined;
+  const cardImageFilename = typeof raw.cardImageFilename === "string" ? raw.cardImageFilename : undefined;
 
   let attachments: PendingAttachment[] | undefined;
   if (Array.isArray(raw.attachments)) {
@@ -100,6 +116,11 @@ function normalizeItem(raw: any): OutboxItem | null {
     values: values as Record<string, any>,
     tries,
     lastError,
+
+    cardImageBase64,
+    cardImageMimeType,
+    cardImageFilename,
+
     attachments,
   };
 }

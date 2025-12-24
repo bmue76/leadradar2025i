@@ -21,9 +21,9 @@ import * as ImageManipulator from "expo-image-manipulator";
 
 import type { RootStackParamList } from "../navigation/types";
 import { useSettings } from "../storage/SettingsContext";
-import { mobileGetJson, mobilePostJson, mobilePostMultipart } from "../lib/mobileApi";
+import { mobileGetJson, mobilePostJson } from "../lib/mobileApi";
 import { uuidv4 } from "../lib/uuid";
-import { enqueueOutbox, type PendingAttachment } from "../storage/outbox";
+import { enqueueOutbox } from "../storage/outbox";
 import { loadFormDetailCache, saveFormDetailCache } from "../storage/formsCache";
 import { DEMO_FORM_ID, getDemoFormDetail } from "../lib/demoForms";
 
@@ -66,8 +66,15 @@ type MobileFormDetail = {
   fields?: MobileFormField[];
 };
 
+type PendingCard = {
+  id: string;
+  createdAt: string;
+  filename: string;
+  mimeType: string; // "image/jpeg"
+  base64: string; // WITHOUT data: prefix
+};
+
 function unwrapPayload(raw: any) {
-  // supports jsonOk shape: { ok: true, data: ... }
   if (raw && typeof raw === "object" && "data" in raw) return (raw as any).data;
   return raw;
 }
@@ -118,34 +125,17 @@ async function deleteLocalFile(uri: string) {
   }
 }
 
-async function copyIntoAppStorage(srcUri: string, filename: string): Promise<string> {
-  const baseDir =
-    (FileSystem as any).documentDirectory ||
-    (FileSystem as any).cacheDirectory ||
-    null;
+function getBase64EncodingValue() {
+  // Expo SDK / typings differ: EncodingType might not exist in TS,
+  // but runtime may still provide it. Fallback to string literal.
+  return ((FileSystem as any).EncodingType?.Base64 ?? "base64") as any;
+}
 
-  if (!baseDir) {
-    // fallback: keep original uri
-    return srcUri;
-  }
-
-  const dir = `${baseDir}lr_attachments/`;
-  try {
-    await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-  } catch {
-    // ignore
-  }
-
-  const id = await uuidv4();
-  const safe = ensureJpgName(filename).replace(/[/\\]/g, "_").replace(/\s+/g, "_");
-  const dst = `${dir}${id}_${safe}`;
-
-  try {
-    await FileSystem.copyAsync({ from: srcUri, to: dst });
-    return dst;
-  } catch {
-    return srcUri;
-  }
+async function readBase64FromUri(uri: string): Promise<string> {
+  const b64 = await FileSystem.readAsStringAsync(uri, {
+    encoding: getBase64EncodingValue(),
+  } as any);
+  return String(b64 || "");
 }
 
 export default function CaptureScreen() {
@@ -162,11 +152,10 @@ export default function CaptureScreen() {
   const [form, setForm] = useState<MobileFormDetail | null>(null);
   const [values, setValues] = useState<Record<string, any>>({});
 
-  // NEW: business card scan (required for “Visitenkarten-Scan”-Process)
-  const [card, setCard] = useState<PendingAttachment | null>(null);
+  // Card required (base64)
+  const [card, setCard] = useState<PendingCard | null>(null);
   const [cardBusy, setCardBusy] = useState(false);
 
-  // For demo form we do NOT require baseUrl (offline-first)
   const canLoad = useMemo(() => isLoaded && !!tenantSlug && !!formId, [isLoaded, tenantSlug, formId]);
 
   const fields = useMemo(() => {
@@ -238,7 +227,6 @@ export default function CaptureScreen() {
     setInfo(null);
 
     try {
-      // ✅ OFFLINE DEMO: never hit backend, render instantly
       if (formId === DEMO_FORM_ID) {
         const demo = getDemoFormDetail(formId);
         if (demo) {
@@ -247,7 +235,6 @@ export default function CaptureScreen() {
         }
       }
 
-      // If baseUrl missing, go directly to cache (or error)
       if (!baseUrl) {
         const cached = await loadFormDetailCache(formId);
         if (cached.payload) {
@@ -275,9 +262,6 @@ export default function CaptureScreen() {
 
       const payload = unwrapPayload(raw);
 
-      // Accept both shapes:
-      // - { form: { ... , fields: [...] } }
-      // - { form: {...}, fields: [...] }
       const f: any = (payload?.form ?? payload) as any;
       if (!Array.isArray(f.fields) && Array.isArray(payload?.fields)) f.fields = payload.fields;
 
@@ -286,7 +270,6 @@ export default function CaptureScreen() {
       const meta = await saveFormDetailCache(formId, raw);
       setInfo(`Online ✓ (cached ${meta.updatedAt})`);
     } catch (e: any) {
-      // 1) cache fallback
       const cached = await loadFormDetailCache(formId);
       if (cached.payload) {
         const raw = cached.payload;
@@ -299,7 +282,6 @@ export default function CaptureScreen() {
         return;
       }
 
-      // 2) demo fallback for this formId (if it matches demo id)
       const demo = getDemoFormDetail(formId);
       if (demo) {
         applyFormObject(demo as any, "Offline → using Demo Form (no cache)");
@@ -377,7 +359,7 @@ export default function CaptureScreen() {
         source === "camera"
           ? await ImagePicker.launchCameraAsync({
               mediaTypes: ImagePicker.MediaTypeOptions.Images,
-              quality: 0.35, // MVP: klein halten (≈ “150dpi reicht” -> niedrige Größe)
+              quality: 0.35,
               allowsEditing: false,
               exif: false,
             })
@@ -392,36 +374,37 @@ export default function CaptureScreen() {
       const asset = res.assets?.[0];
       if (!asset?.uri) return;
 
-      // MVP: downscale (pixel) + compress. (SW/grayscale machen wir später serverseitig, falls nötig.)
       let finalUri = asset.uri;
       try {
+        const width = asset.width || 1100;
+        const targetW = Math.min(1100, width);
         const manipulated = await ImageManipulator.manipulateAsync(
           asset.uri,
-          [{ resize: { width: Math.min(1100, asset.width || 1100) } }],
+          [{ resize: { width: targetW } }],
           { compress: 0.35, format: ImageManipulator.SaveFormat.JPEG }
         );
         if (manipulated?.uri) finalUri = manipulated.uri;
       } catch {
-        // ignore (keep original)
+        // ignore
       }
 
       const filename = ensureJpgName(asset.fileName || basenameFromUri(finalUri) || "businesscard.jpg");
-      const storedUri = await copyIntoAppStorage(finalUri, filename);
+      const base64 = await readBase64FromUri(finalUri);
+
+      if (finalUri && finalUri !== asset.uri) {
+        await deleteLocalFile(finalUri);
+      }
 
       const now = new Date().toISOString();
-      const att: PendingAttachment = {
+      setCard({
         id: await uuidv4(),
-        type: "IMAGE",
+        createdAt: now,
         filename,
         mimeType: "image/jpeg",
-        localUri: storedUri,
-        status: "PENDING",
-        createdAt: now,
-        tries: 0,
-      };
+        base64,
+      });
 
-      setCard(att);
-      setInfo("Visitenkarte bereit. Wird beim Speichern mitgesendet. ✅");
+      setInfo("Visitenkarte bereit (Base64). Wird beim Speichern mitgesendet. ✅");
     } catch (e: any) {
       setError(e?.message ? String(e.message) : "Visitenkarte konnte nicht erfasst werden.");
     } finally {
@@ -430,7 +413,6 @@ export default function CaptureScreen() {
   }
 
   async function removeCard() {
-    if (card?.localUri) await deleteLocalFile(card.localUri);
     setCard(null);
   }
 
@@ -447,8 +429,7 @@ export default function CaptureScreen() {
       return;
     }
 
-    // Process: with business-card scan, an image is ALWAYS included
-    if (!card) {
+    if (!card?.base64) {
       Alert.alert("Visitenkarte fehlt", "Bitte zuerst eine Visitenkarte aufnehmen oder aus der Galerie wählen.");
       return;
     }
@@ -458,43 +439,34 @@ export default function CaptureScreen() {
     setInfo(null);
 
     const clientLeadId = await uuidv4();
-    const leadPayload = {
+
+    const body = {
       formId: form.id,
       clientLeadId,
       values,
       capturedByDeviceUid: deviceUid,
+      cardImageBase64: card.base64,
+      cardImageMimeType: card.mimeType,
+      cardImageFilename: card.filename,
     };
 
     try {
       if (!baseUrl) throw new Error("No baseUrl");
 
-      // Send as multipart lead+scan
-      await mobilePostMultipart({
+      await mobilePostJson({
         baseUrl,
         tenantSlug,
         path: "/api/mobile/v1/leads",
         timeoutMs: 15000,
-        fields: {
-          payload: JSON.stringify(leadPayload),
-          type: "IMAGE",
-        },
-        file: {
-          uri: card.localUri,
-          name: card.filename,
-          mimeType: card.mimeType || "image/jpeg",
-        },
+        body,
       });
 
       setInfo("Lead + Visitenkarte gespeichert. ✅");
       resetValues();
-
-      // cleanup local card file after successful upload
-      if (card.localUri) await deleteLocalFile(card.localUri);
       setCard(null);
     } catch (e: any) {
       const msg = e?.message ? String(e.message) : "Save failed, queued.";
 
-      // Queue in outbox WITH pending attachment
       await enqueueOutbox({
         id: await uuidv4(),
         createdAt: new Date().toISOString(),
@@ -504,20 +476,13 @@ export default function CaptureScreen() {
         values,
         tries: 0,
         lastError: msg,
-        attachments: [
-          {
-            ...card,
-            status: "PENDING",
-            tries: card.tries ?? 0,
-            lastError: msg,
-          },
-        ],
+        cardImageBase64: card.base64,
+        cardImageMimeType: card.mimeType,
+        cardImageFilename: card.filename,
       });
 
       setInfo("Offline/failed → Lead + Visitenkarte in Outbox. ⏳");
       resetValues();
-
-      // keep UI clean for next lead (file stays in app storage for later sync)
       setCard(null);
     } finally {
       setSaving(false);
@@ -695,11 +660,11 @@ export default function CaptureScreen() {
               <Text style={styles.hint}>No form loaded.</Text>
             ) : (
               <>
-                {/* Business card scan (required) */}
                 <View style={styles.cardBox}>
                   <Text style={styles.cardTitle}>Visitenkarte (Scan)</Text>
                   <Text style={styles.cardText}>
-                    Prozess: Bei jedem Lead wird ein Visitenkarten-Abbild mitgesendet (MVP: komprimiertes JPG).
+                    Prozess: Bei jedem Lead wird ein Visitenkarten-Abbild mitgesendet (MVP: komprimiertes JPG als Base64
+                    im Lead-Create).
                   </Text>
 
                   {card ? (
@@ -745,7 +710,9 @@ export default function CaptureScreen() {
 
                 <View style={styles.footerCard}>
                   <Text style={styles.footerTitle}>Save Lead</Text>
-                  <Text style={styles.footerText}>Online: multipart Lead + Visitenkarte. Offline/fail: queued to Outbox.</Text>
+                  <Text style={styles.footerText}>
+                    Online: JSON Lead + cardImageBase64. Offline/fail: queued to Outbox (inkl. Base64).
+                  </Text>
 
                   <Pressable
                     style={[styles.btnPrimary, (saving || !card) ? { opacity: 0.6 } : null]}
