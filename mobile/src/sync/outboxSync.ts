@@ -1,6 +1,6 @@
 // mobile/src/sync/outboxSync.ts
 import { DeviceEventEmitter } from "react-native";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 
 import { mobilePostJson } from "../lib/mobileApi";
 import { DEMO_FORM_ID } from "../lib/demoForms";

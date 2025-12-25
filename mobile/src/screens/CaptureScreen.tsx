@@ -16,7 +16,7 @@ import { useRoute } from "@react-navigation/native";
 import type { RouteProp } from "@react-navigation/native";
 
 import * as ImagePicker from "expo-image-picker";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 import * as ImageManipulator from "expo-image-manipulator";
 
 import type { RootStackParamList } from "../navigation/types";
