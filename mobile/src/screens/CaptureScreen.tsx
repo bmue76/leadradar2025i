@@ -27,6 +27,10 @@ import { enqueueOutbox } from "../storage/outbox";
 import { loadFormDetailCache, saveFormDetailCache } from "../storage/formsCache";
 import { DEMO_FORM_ID, getDemoFormDetail } from "../lib/demoForms";
 
+import { recognizeText } from "../ocr/recognizeText";
+import { parseBusinessCard } from "../ocr/parseBusinessCard";
+import type { LeadOcrMetaV1, OcrFieldKey } from "../ocr/types";
+
 type R = RouteProp<RootStackParamList, "Capture">;
 
 type FieldType =
@@ -138,6 +142,18 @@ async function readBase64FromUri(uri: string): Promise<string> {
   return String(b64 || "");
 }
 
+function isDev() {
+  return typeof __DEV__ !== "undefined" && !!__DEV__;
+}
+
+function lc(s: any) {
+  return String(s ?? "").toLowerCase();
+}
+
+function isStringishFieldType(t: FieldType) {
+  return t === "TEXT" || t === "TEXTAREA" || t === "EMAIL" || t === "PHONE" || t === "URL" || t === "NUMBER";
+}
+
 export default function CaptureScreen() {
   const route = useRoute<R>();
   const { formId, formName } = route.params;
@@ -155,6 +171,15 @@ export default function CaptureScreen() {
   // Card required (base64)
   const [card, setCard] = useState<PendingCard | null>(null);
   const [cardBusy, setCardBusy] = useState(false);
+
+  // OCR
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrError, setOcrError] = useState<string | null>(null);
+  const [ocrInfo, setOcrInfo] = useState<string | null>(null);
+  const [ocrMeta, setOcrMeta] = useState<LeadOcrMetaV1 | null>(null);
+  const [ocrApply, setOcrApply] = useState<Partial<Record<OcrFieldKey, boolean>>>({});
+  const [ocrOverwrite, setOcrOverwrite] = useState(false);
+  const [showOcrRaw, setShowOcrRaw] = useState(false);
 
   const canLoad = useMemo(() => isLoaded && !!tenantSlug && !!formId, [isLoaded, tenantSlug, formId]);
 
@@ -301,6 +326,16 @@ export default function CaptureScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canLoad, baseUrl, tenantSlug, formId]);
 
+  // When card changes, OCR should be reset (avoid applying OCR from an old image)
+  useEffect(() => {
+    setOcrError(null);
+    setOcrInfo(null);
+    setOcrMeta(null);
+    setOcrApply({});
+    setOcrOverwrite(false);
+    setShowOcrRaw(false);
+  }, [card?.id]);
+
   function setValue(k: string, v: any) {
     setValues((prev) => ({ ...prev, [k]: v }));
   }
@@ -416,6 +451,155 @@ export default function CaptureScreen() {
     setCard(null);
   }
 
+  async function writeTempJpgFromBase64(base64: string): Promise<string> {
+    const safeRand = Math.random().toString(16).slice(2);
+    const uri = `${FileSystem.cacheDirectory ?? ""}ocr_${Date.now()}_${safeRand}.jpg`;
+    if (!uri) throw new Error("No cacheDirectory available to write temp OCR file.");
+    await FileSystem.writeAsStringAsync(
+      uri,
+      base64,
+      {
+        encoding: getBase64EncodingValue(),
+      } as any
+    );
+    return uri;
+  }
+
+  function findFieldByType(t: FieldType) {
+    return fields.find((f) => f.type === t && f.isActive !== false) ?? null;
+  }
+
+  function findFieldByTextHints(hints: string[]) {
+    const hs = hints.map((h) => h.toLowerCase());
+    for (const f of fields) {
+      if (f.isActive === false) continue;
+      const hay = `${lc(f.key)} ${lc(f.label)}`;
+      if (hs.some((h) => hay.includes(h))) return f;
+    }
+    return null;
+  }
+
+  function pickTargetField(kind: OcrFieldKey): MobileFormField | null {
+    if (kind === "email") return findFieldByType("EMAIL") ?? findFieldByTextHints(["email", "e-mail", "mail"]);
+    if (kind === "phone") return findFieldByType("PHONE") ?? findFieldByTextHints(["phone", "telefon", "tel", "mobile", "handy"]);
+    if (kind === "url") return findFieldByType("URL") ?? findFieldByTextHints(["web", "website", "url", "homepage"]);
+    if (kind === "company") return findFieldByTextHints(["company", "firma", "unternehmen", "organisation", "organization"]) ?? null;
+    if (kind === "name") return findFieldByTextHints(["name", "kontakt", "ansprechpartner", "person"]) ?? null;
+    return null;
+  }
+
+  function findNameSplitTargets(): { first?: MobileFormField | null; last?: MobileFormField | null } {
+    const first = findFieldByTextHints(["vorname", "firstname", "first name", "given name"]) ?? null;
+    const last = findFieldByTextHints(["nachname", "lastname", "last name", "surname", "family name"]) ?? null;
+    return { first, last };
+  }
+
+  async function onOcrScan() {
+    if (!card?.base64) {
+      Alert.alert("Keine Visitenkarte", "Bitte zuerst eine Visitenkarte aufnehmen oder aus der Galerie wählen.");
+      return;
+    }
+
+    setOcrBusy(true);
+    setOcrError(null);
+    setOcrInfo(null);
+
+    let tmpUri: string | null = null;
+
+    try {
+      tmpUri = await writeTempJpgFromBase64(card.base64);
+
+      const rec = await recognizeText(tmpUri);
+      const parsed = parseBusinessCard(rec);
+
+      const meta: LeadOcrMetaV1 = {
+        version: 1,
+        provider: "mlkit-text-recognition",
+        createdAt: new Date().toISOString(),
+        rawText: rec.rawText,
+        extracted: parsed.extracted,
+        confidence: parsed.confidence,
+        notes: parsed.notes,
+      };
+
+      const nextApply: Partial<Record<OcrFieldKey, boolean>> = {};
+      (["email", "phone", "url", "name", "company"] as OcrFieldKey[]).forEach((k) => {
+        if ((meta.extracted as any)?.[k]) nextApply[k] = true;
+      });
+
+      setOcrMeta(meta);
+      setOcrApply(nextApply);
+      setOcrInfo("OCR fertig. Bitte Vorschläge prüfen und bei Bedarf übernehmen. ✅");
+    } catch (e: any) {
+      const msg = e?.message ? String(e.message) : "OCR fehlgeschlagen.";
+      setOcrError(msg);
+    } finally {
+      if (tmpUri) await deleteLocalFile(tmpUri);
+      setOcrBusy(false);
+    }
+  }
+
+  function applyOcrToValues() {
+    if (!ocrMeta) return;
+
+    const extracted = ocrMeta.extracted ?? {};
+    const chosen: OcrFieldKey[] = (["email", "phone", "url", "name", "company"] as OcrFieldKey[]).filter(
+      (k) => !!ocrApply?.[k] && typeof (extracted as any)[k] === "string" && String((extracted as any)[k]).trim() !== ""
+    );
+
+    if (chosen.length === 0) {
+      Alert.alert("Keine Auswahl", "Bitte mindestens einen Vorschlag auswählen.");
+      return;
+    }
+
+    setValues((prev) => {
+      const next = { ...prev };
+
+      const nameVal = typeof (extracted as any).name === "string" ? String((extracted as any).name).trim() : "";
+      const splitTargets = findNameSplitTargets();
+
+      for (const kind of chosen) {
+        const val = String((extracted as any)[kind] ?? "").trim();
+        if (!val) continue;
+
+        if (kind === "name" && nameVal && splitTargets.first && splitTargets.last) {
+          const fk = fieldKey(splitTargets.first);
+          const lk = fieldKey(splitTargets.last);
+
+          const parts = nameVal.split(/\s+/g).filter(Boolean);
+          const first = parts[0] ?? "";
+          const last = parts.slice(1).join(" ").trim();
+
+          if (first) {
+            const cur = typeof next[fk] === "string" ? String(next[fk]).trim() : "";
+            if (ocrOverwrite || !cur) next[fk] = first;
+          }
+          if (last) {
+            const cur = typeof next[lk] === "string" ? String(next[lk]).trim() : "";
+            if (ocrOverwrite || !cur) next[lk] = last;
+          }
+          continue;
+        }
+
+        const target = pickTargetField(kind);
+        if (!target) continue;
+
+        if (!isStringishFieldType(target.type)) continue;
+
+        const k = fieldKey(target);
+        const cur = typeof next[k] === "string" ? String(next[k]).trim() : "";
+
+        if (!ocrOverwrite && cur) continue;
+
+        next[k] = val;
+      }
+
+      return next;
+    });
+
+    setOcrInfo("Vorschläge übernommen (best-effort). ✍️");
+  }
+
   async function onSaveLead() {
     if (!form) return;
     if (!tenantSlug) {
@@ -440,7 +624,7 @@ export default function CaptureScreen() {
 
     const clientLeadId = await uuidv4();
 
-    const body = {
+    const body: any = {
       formId: form.id,
       clientLeadId,
       values,
@@ -449,6 +633,10 @@ export default function CaptureScreen() {
       cardImageMimeType: card.mimeType,
       cardImageFilename: card.filename,
     };
+
+    if (ocrMeta) {
+      body.meta = { ...(body.meta ?? {}), ocr: ocrMeta };
+    }
 
     try {
       if (!baseUrl) throw new Error("No baseUrl");
@@ -474,6 +662,9 @@ export default function CaptureScreen() {
         clientLeadId,
         capturedByDeviceUid: deviceUid,
         values,
+
+        meta: ocrMeta ? { ocr: ocrMeta } : undefined,
+
         tries: 0,
         lastError: msg,
         cardImageBase64: card.base64,
@@ -620,6 +811,20 @@ export default function CaptureScreen() {
 
   const title = form?.name ?? formName ?? "Form";
 
+  const extracted = ocrMeta?.extracted ?? {};
+  const extractedKeys = (["email", "phone", "url", "name", "company"] as OcrFieldKey[]).filter(
+    (k) => typeof (extracted as any)[k] === "string" && String((extracted as any)[k]).trim() !== ""
+  );
+
+  function labelFor(k: OcrFieldKey) {
+    if (k === "email") return "E-Mail";
+    if (k === "phone") return "Telefon";
+    if (k === "url") return "Website";
+    if (k === "name") return "Name";
+    if (k === "company") return "Firma";
+    return k;
+  }
+
   return (
     <SafeAreaView style={styles.safe}>
       <KeyboardAvoidingView
@@ -683,7 +888,18 @@ export default function CaptureScreen() {
                         <Pressable onPress={removeCard} style={styles.btnDangerSmall}>
                           <Text style={styles.btnDangerSmallText}>Entfernen</Text>
                         </Pressable>
+
+                        <Pressable
+                          onPress={onOcrScan}
+                          style={[styles.btnPrimary, !card || ocrBusy || cardBusy ? { opacity: 0.6 } : null]}
+                          disabled={!card || ocrBusy || cardBusy}
+                        >
+                          <Text style={styles.btnPrimaryText}>{ocrBusy ? "OCR…" : "OCR scannen"}</Text>
+                        </Pressable>
                       </View>
+
+                      {ocrError ? <Text style={styles.error}>OCR: {ocrError}</Text> : null}
+                      {ocrInfo ? <Text style={styles.info}>{ocrInfo}</Text> : null}
                     </View>
                   ) : (
                     <View style={styles.actionsRow}>
@@ -706,12 +922,70 @@ export default function CaptureScreen() {
                   )}
                 </View>
 
+                {ocrMeta ? (
+                  <View style={styles.ocrBox}>
+                    <Text style={styles.ocrTitle}>OCR Vorschläge (Review)</Text>
+
+                    {extractedKeys.length === 0 ? (
+                      <Text style={styles.help}>Keine verwertbaren Vorschläge gefunden.</Text>
+                    ) : (
+                      <View style={{ gap: 10 }}>
+                        {extractedKeys.map((k) => {
+                          const v = String((extracted as any)[k] ?? "");
+                          const checked = ocrApply?.[k] !== false;
+                          const target = pickTargetField(k);
+                          const targetLabel = target ? String(target.label ?? target.key ?? fieldKey(target)) : "—";
+                          return (
+                            <View key={`ocr:${k}`} style={styles.ocrRow}>
+                              <View style={{ flex: 1, gap: 3 }}>
+                                <Text style={styles.ocrKey}>{labelFor(k)}</Text>
+                                <Text style={styles.ocrVal}>{v}</Text>
+                                <Text style={styles.ocrHint}>
+                                  Ziel-Feld: <Text style={styles.mono}>{targetLabel}</Text>
+                                </Text>
+                              </View>
+                              <Switch value={!!checked} onValueChange={(nv) => setOcrApply((prev) => ({ ...prev, [k]: nv }))} />
+                            </View>
+                          );
+                        })}
+
+                        <View style={styles.rowBetween}>
+                          <View style={{ flex: 1, gap: 2 }}>
+                            <Text style={styles.ocrKey}>Bestehende Werte überschreiben</Text>
+                            <Text style={styles.help}>Standard: nur leere Felder befüllen.</Text>
+                          </View>
+                          <Switch value={ocrOverwrite} onValueChange={setOcrOverwrite} />
+                        </View>
+
+                        <Pressable onPress={applyOcrToValues} style={styles.btnPrimary}>
+                          <Text style={styles.btnPrimaryText}>Übernehmen</Text>
+                        </Pressable>
+
+                        {isDev() ? (
+                          <View style={{ gap: 8 }}>
+                            <Pressable onPress={() => setShowOcrRaw((p) => !p)} style={styles.btnGhost}>
+                              <Text style={styles.btnGhostText}>
+                                {showOcrRaw ? "OCR Rohtext ausblenden" : "OCR Rohtext anzeigen (DEV)"}
+                              </Text>
+                            </Pressable>
+                            {showOcrRaw ? (
+                              <View style={styles.ocrRawBox}>
+                                <Text style={styles.mono}>{ocrMeta.rawText || "—"}</Text>
+                              </View>
+                            ) : null}
+                          </View>
+                        ) : null}
+                      </View>
+                    )}
+                  </View>
+                ) : null}
+
                 {fields.map(renderField)}
 
                 <View style={styles.footerCard}>
                   <Text style={styles.footerTitle}>Save Lead</Text>
                   <Text style={styles.footerText}>
-                    Online: JSON Lead + cardImageBase64. Offline/fail: queued to Outbox (inkl. Base64).
+                    Online: JSON Lead + cardImageBase64 (+ optional meta.ocr). Offline/fail: queued to Outbox (inkl. Base64).
                   </Text>
 
                   <Pressable
@@ -719,9 +993,7 @@ export default function CaptureScreen() {
                     onPress={onSaveLead}
                     disabled={saving || !card}
                   >
-                    <Text style={styles.btnPrimaryText}>
-                      {saving ? "Saving…" : !card ? "Visitenkarte erforderlich" : "Save Lead"}
-                    </Text>
+                    <Text style={styles.btnPrimaryText}>{saving ? "Saving…" : !card ? "Visitenkarte erforderlich" : "Save Lead"}</Text>
                   </Pressable>
                 </View>
               </>
@@ -775,7 +1047,7 @@ const styles = StyleSheet.create({
   },
   textarea: { minHeight: 110, textAlignVertical: "top" },
 
-  rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  rowBetween: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10 },
   valueHint: { color: "#444", fontWeight: "700" },
 
   optionsWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
@@ -798,4 +1070,12 @@ const styles = StyleSheet.create({
 
   btnDangerSmall: { borderWidth: 1, borderColor: "#b00020", paddingHorizontal: 12, paddingVertical: 10, borderRadius: 10 },
   btnDangerSmallText: { color: "#b00020", fontWeight: "900" },
+
+  ocrBox: { borderWidth: 1, borderColor: "#e7e7ea", borderRadius: 12, padding: 12, gap: 10 },
+  ocrTitle: { fontSize: 16, fontWeight: "900" },
+  ocrRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  ocrKey: { fontWeight: "900" },
+  ocrVal: { color: "#111", fontWeight: "700" },
+  ocrHint: { color: "#555", fontSize: 12 },
+  ocrRawBox: { borderWidth: 1, borderColor: "#eee", borderRadius: 12, padding: 12, backgroundColor: "#fafafa" },
 });

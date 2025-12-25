@@ -1,5 +1,6 @@
 // mobile/src/storage/outbox.ts
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import type { LeadOcrMetaV1 } from "../ocr/types";
 
 const KEY_OUTBOX = "lr:outbox";
 
@@ -40,6 +41,14 @@ export type OutboxError = {
   at: string; // ISO string
 };
 
+export type LeadMeta = {
+  // MVP: OCR meta lives here
+  ocr?: LeadOcrMetaV1;
+
+  // allow future meta keys without migrations
+  [k: string]: unknown;
+};
+
 export type OutboxItem = {
   id: string;
   createdAt: string;
@@ -49,6 +58,9 @@ export type OutboxItem = {
   capturedByDeviceUid?: string;
 
   values: Record<string, any>;
+
+  // Optional lead meta (e.g. OCR)
+  meta?: LeadMeta;
 
   // Resilience
   tries: number;
@@ -100,6 +112,20 @@ function normalizeError(raw: any, fallbackAt: string): OutboxError | string | un
   return undefined;
 }
 
+function normalizeMeta(raw: any): LeadMeta | undefined {
+  if (!raw) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) return undefined;
+
+  // we do not deep-validate; store best-effort
+  const m = raw as LeadMeta;
+
+  // if empty object, treat as undefined
+  const keys = Object.keys(m);
+  if (!keys.length) return undefined;
+
+  return m;
+}
+
 function normalizeItemWithMeta(raw: any): { item: OutboxItem | null; migrated: boolean } {
   let migrated = false;
 
@@ -128,14 +154,17 @@ function normalizeItemWithMeta(raw: any): { item: OutboxItem | null; migrated: b
   if (typeof raw.lastError === "string") migrated = true;
 
   // status: derive fallback
-  const derivedFallback: OutboxItemStatus =
-    tries > 0 || lastError ? "FAILED" : "QUEUED";
+  const derivedFallback: OutboxItemStatus = tries > 0 || lastError ? "FAILED" : "QUEUED";
   const status = normalizeStatus(raw.status, derivedFallback);
   if (raw.status && typeof raw.status !== "string") migrated = true;
 
   const cardImageBase64 = typeof raw.cardImageBase64 === "string" ? raw.cardImageBase64 : undefined;
   const cardImageMimeType = typeof raw.cardImageMimeType === "string" ? raw.cardImageMimeType : undefined;
   const cardImageFilename = typeof raw.cardImageFilename === "string" ? raw.cardImageFilename : undefined;
+
+  // meta (e.g. ocr)
+  const meta = normalizeMeta(raw.meta);
+  if (raw.meta !== undefined && !meta) migrated = true;
 
   let attachments: PendingAttachment[] | undefined;
   if (Array.isArray(raw.attachments)) {
@@ -177,6 +206,8 @@ function normalizeItemWithMeta(raw: any): { item: OutboxItem | null; migrated: b
     clientLeadId,
     capturedByDeviceUid,
     values: values as Record<string, any>,
+
+    meta,
 
     tries,
     lastError,

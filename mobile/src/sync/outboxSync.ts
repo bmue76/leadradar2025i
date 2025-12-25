@@ -102,11 +102,59 @@ async function readBase64FromUri(uri: string): Promise<string> {
   return stripDataPrefix(String(b64 || ""));
 }
 
-async function setItemState(
-  id: string,
-  patch: Partial<OutboxItem> & { status?: OutboxItemStatus }
-): Promise<void> {
+async function setItemState(id: string, patch: Partial<OutboxItem> & { status?: OutboxItemStatus }): Promise<void> {
   await updateOutboxItem(id, patch);
+}
+
+function shouldRetryWithoutMeta(e: any): boolean {
+  const msg = String(e?.message ?? "").toLowerCase();
+  // Heuristic: backend might reject unknown key "meta" (zod/validation)
+  if (!msg.includes("meta")) return false;
+  return (
+    msg.includes("unrecognized") ||
+    msg.includes("unknown") ||
+    msg.includes("unexpected") ||
+    msg.includes("invalid") ||
+    msg.includes("zod")
+  );
+}
+
+async function postLeadWithOptionalMetaFallback(args: {
+  baseUrl: string;
+  tenantSlug: string;
+  timeoutMs: number;
+  body: any;
+}): Promise<{ usedMeta: boolean }> {
+  const { baseUrl, tenantSlug, timeoutMs } = args;
+
+  try {
+    await mobilePostJson({
+      baseUrl,
+      tenantSlug,
+      path: "/api/mobile/v1/leads",
+      timeoutMs: Math.max(timeoutMs, 15000),
+      body: args.body,
+    });
+    return { usedMeta: !!args.body?.meta };
+  } catch (e: any) {
+    // if we sent meta and backend rejects it → retry without meta (best-effort)
+    if (args.body?.meta && shouldRetryWithoutMeta(e)) {
+      const body2 = { ...args.body };
+      delete body2.meta;
+
+      await mobilePostJson({
+        baseUrl,
+        tenantSlug,
+        path: "/api/mobile/v1/leads",
+        timeoutMs: Math.max(timeoutMs, 15000),
+        body: body2,
+      });
+
+      return { usedMeta: false };
+    }
+
+    throw e;
+  }
 }
 
 async function syncOneInternal(args: {
@@ -171,27 +219,30 @@ async function syncOneInternal(args: {
       cardImageFilename = legacyAtt.filename || cardImageFilename;
     }
 
-    // Post lead (JSON)
-    await mobilePostJson({
+    const leadBody: any = {
+      formId: item.formId,
+      clientLeadId: item.clientLeadId,
+      values: item.values,
+      capturedByDeviceUid: item.capturedByDeviceUid,
+
+      ...(cardImageBase64
+        ? {
+            cardImageBase64,
+            cardImageMimeType,
+            cardImageFilename,
+          }
+        : {}),
+    };
+
+    if (item.meta && typeof item.meta === "object") {
+      leadBody.meta = item.meta;
+    }
+
+    await postLeadWithOptionalMetaFallback({
       baseUrl,
       tenantSlug,
-      path: "/api/mobile/v1/leads",
-      timeoutMs: Math.max(timeoutMs, 15000),
-      body: {
-        formId: item.formId,
-        clientLeadId: item.clientLeadId,
-        values: item.values,
-        capturedByDeviceUid: item.capturedByDeviceUid,
-
-        // include only if present (server accepts optional)
-        ...(cardImageBase64
-          ? {
-              cardImageBase64,
-              cardImageMimeType,
-              cardImageFilename,
-            }
-          : {}),
-      },
+      timeoutMs,
+      body: leadBody,
     });
 
     // cleanup legacy local file if we used it
