@@ -1,3 +1,4 @@
+// mobile/src/sync/outboxSync.ts
 import { DeviceEventEmitter } from "react-native";
 import * as FileSystem from "expo-file-system";
 
@@ -45,12 +46,23 @@ function isDemoLead(item: OutboxItem) {
   return item.formId === DEMO_FORM_ID || item.formId.startsWith("demo-");
 }
 
-function firstPendingAttachment(item: OutboxItem): PendingAttachment | null {
+function stripDataPrefix(b64: string): string {
+  const s = String(b64 || "").trim();
+  if (!s) return "";
+  if (s.startsWith("data:")) {
+    const idx = s.indexOf(",");
+    if (idx >= 0) return s.slice(idx + 1);
+  }
+  return s;
+}
+
+function firstLegacyAttachment(item: OutboxItem): PendingAttachment | null {
   const list = Array.isArray(item.attachments) ? item.attachments : [];
   for (const a of list) {
     if (!a) continue;
-    if (a.status === "UPLOADED") continue;
     if (!a.localUri || !a.filename || !a.mimeType) continue;
+    // allow retry even if FAILED
+    if (a.status === "UPLOADED") continue;
     return a;
   }
   return null;
@@ -73,13 +85,10 @@ async function deleteLocalFile(uri: string) {
   }
 }
 
-async function readBase64(uri: string): Promise<string> {
-  // ✅ Keine EncodingType Referenz (TS-safe in allen Expo-Versionen)
-  const b64 = await FileSystem.readAsStringAsync(
-    uri,
-    { encoding: "base64" as any } as any
-  );
-  return String(b64 || "");
+async function readBase64FromUri(uri: string): Promise<string> {
+  // Expo SDK typings differ → use string literal (TS-safe)
+  const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" as any } as any);
+  return stripDataPrefix(String(b64 || ""));
 }
 
 /**
@@ -94,29 +103,25 @@ export async function syncOutboxNow(args: {
   isOnline?: boolean;
   timeoutMs?: number; // default 8000
 }): Promise<OutboxSyncSummary> {
-  const finishedAt = new Date().toISOString();
   const reason = args.reason ?? "manual";
   const timeoutMs = args.timeoutMs ?? 8000;
 
   if (__syncMutex) {
+    const finishedAt = new Date().toISOString();
     emitStatus({ syncing: false, skipped: 1, skippedReason: "busy", reason, finishedAt });
     return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (busy)", finishedAt };
   }
 
   if (args.isOnline === false) {
+    const finishedAt = new Date().toISOString();
     emitStatus({ syncing: false, skipped: 1, skippedReason: "offline", reason, finishedAt });
     return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (offline)", finishedAt };
   }
 
   if (!args.baseUrl || !args.tenantSlug) {
+    const finishedAt = new Date().toISOString();
     emitStatus({ syncing: false, skipped: 1, skippedReason: "settings", reason, finishedAt });
-    return {
-      ok: 0,
-      failed: 0,
-      skipped: 1,
-      message: "Cannot sync: missing baseUrl/tenantSlug (Settings).",
-      finishedAt,
-    };
+    return { ok: 0, failed: 0, skipped: 1, message: "Cannot sync: missing baseUrl/tenantSlug (Settings).", finishedAt };
   }
 
   __syncMutex = true;
@@ -131,9 +136,9 @@ export async function syncOutboxNow(args: {
     const current = await loadOutbox();
 
     if (!current.length) {
-      const fin = new Date().toISOString();
-      emitStatus({ syncing: false, reason, startedAt, finishedAt: fin, skipped: 1, skippedReason: "empty" });
-      return { ok: 0, failed: 0, skipped: 1, message: "Outbox empty (nothing to sync).", finishedAt: fin };
+      const finishedAt = new Date().toISOString();
+      emitStatus({ syncing: false, reason, startedAt, finishedAt, skipped: 1, skippedReason: "empty" });
+      return { ok: 0, failed: 0, skipped: 1, message: "Outbox empty (nothing to sync).", finishedAt };
     }
 
     for (const item of current) {
@@ -145,17 +150,21 @@ export async function syncOutboxNow(args: {
         continue;
       }
 
-      const att = firstPendingAttachment(item);
-
       try {
-        // Prefer: if pending attachment exists -> send inline base64 (server accepts it)
-        if (att) {
-          const exists = await localFileExists(att.localUri);
+        // Preferred: inline card base64 (new flow)
+        let cardImageBase64 = stripDataPrefix(item.cardImageBase64 || "");
+        let cardImageMimeType = String(item.cardImageMimeType || "image/jpeg");
+        let cardImageFilename = String(item.cardImageFilename || "businesscard.jpg");
+
+        // Legacy fallback: attachments[] -> read file base64 and send inline
+        const legacyAtt = !cardImageBase64 ? firstLegacyAttachment(item) : null;
+        if (legacyAtt) {
+          const exists = await localFileExists(legacyAtt.localUri);
           if (!exists) {
             failed += 1;
 
             const nextAttachments = (item.attachments ?? []).map((a) =>
-              a.id === att.id
+              a.id === legacyAtt.id
                 ? {
                     ...a,
                     status: "FAILED" as const,
@@ -173,58 +182,52 @@ export async function syncOutboxNow(args: {
             continue;
           }
 
-          const base64 = await readBase64(att.localUri);
-
-          await mobilePostJson({
-            baseUrl: args.baseUrl,
-            tenantSlug: args.tenantSlug,
-            path: "/api/mobile/v1/leads",
-            timeoutMs: Math.max(timeoutMs, 15000),
-            body: {
-              formId: item.formId,
-              clientLeadId: item.clientLeadId,
-              values: item.values,
-              capturedByDeviceUid: item.capturedByDeviceUid,
-              cardImageBase64: base64,
-              cardImageMimeType: att.mimeType,
-              cardImageFilename: att.filename,
-            },
-          });
-
-          ok += 1;
-
-          // cleanup local file when synced successfully
-          await deleteLocalFile(att.localUri);
-
-          await removeOutboxItem(item.id);
-          continue;
+          cardImageBase64 = await readBase64FromUri(legacyAtt.localUri);
+          cardImageMimeType = legacyAtt.mimeType || cardImageMimeType;
+          cardImageFilename = legacyAtt.filename || cardImageFilename;
         }
 
-        // Fallback: classic JSON lead sync without card
+        // Post lead (JSON)
         await mobilePostJson({
           baseUrl: args.baseUrl,
           tenantSlug: args.tenantSlug,
           path: "/api/mobile/v1/leads",
-          timeoutMs,
+          timeoutMs: Math.max(timeoutMs, 15000),
           body: {
             formId: item.formId,
             clientLeadId: item.clientLeadId,
             values: item.values,
             capturedByDeviceUid: item.capturedByDeviceUid,
+
+            // include only if present (server accepts optional)
+            ...(cardImageBase64
+              ? {
+                  cardImageBase64,
+                  cardImageMimeType,
+                  cardImageFilename,
+                }
+              : {}),
           },
         });
 
         ok += 1;
+
+        // cleanup legacy local file if we used it
+        if (legacyAtt?.localUri) {
+          await deleteLocalFile(legacyAtt.localUri);
+        }
+
         await removeOutboxItem(item.id);
       } catch (e: any) {
         failed += 1;
         const msg = e?.message ? String(e.message) : "Sync failed";
 
-        // If attachment exists: mark it FAILED (keep queued)
+        // mark legacy attachment as FAILED (keep queued)
+        const legacyAtt = firstLegacyAttachment(item);
         let nextAttachments = item.attachments;
-        if (att && Array.isArray(item.attachments)) {
+        if (legacyAtt && Array.isArray(item.attachments)) {
           nextAttachments = item.attachments.map((a) =>
-            a.id === att.id
+            a.id === legacyAtt.id
               ? {
                   ...a,
                   status: "FAILED" as const,
@@ -243,20 +246,26 @@ export async function syncOutboxNow(args: {
       }
     }
 
-    const fin = new Date().toISOString();
-    emitStatus({ syncing: false, reason, startedAt, finishedAt: fin, ok, failed, skipped });
+    const finishedAt = new Date().toISOString();
+    emitStatus({ syncing: false, reason, startedAt, finishedAt, ok, failed, skipped });
     return {
       ok,
       failed,
       skipped,
       message: `Sync finished: ok=${ok}, failed=${failed}, skipped(demo)=${skipped}`,
-      finishedAt: fin,
+      finishedAt,
     };
   } catch (e: any) {
-    const fin = new Date().toISOString();
+    const finishedAt = new Date().toISOString();
     const msg = e?.message ? String(e.message) : "Sync error";
-    emitStatus({ syncing: false, reason, startedAt, finishedAt: fin, ok, failed, skipped, error: msg });
-    return { ok, failed: failed + 1, skipped, message: `Sync error: ${msg}`, finishedAt: fin };
+    emitStatus({ syncing: false, reason, startedAt, finishedAt, ok, failed, skipped, error: msg });
+    return {
+      ok,
+      failed: failed + 1,
+      skipped,
+      message: `Sync error: ${msg}`,
+      finishedAt,
+    };
   } finally {
     __syncMutex = false;
   }
