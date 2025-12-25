@@ -8,7 +8,9 @@ import {
   loadOutbox,
   removeOutboxItem,
   updateOutboxItem,
+  type OutboxError,
   type OutboxItem,
+  type OutboxItemStatus,
   type PendingAttachment,
 } from "../storage/outbox";
 
@@ -42,6 +44,10 @@ function emitStatus(payload: OutboxSyncStatus) {
   DeviceEventEmitter.emit(OUTBOX_SYNC_STATUS_EVENT, payload);
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
 function isDemoLead(item: OutboxItem) {
   return item.formId === DEMO_FORM_ID || item.formId.startsWith("demo-");
 }
@@ -54,6 +60,11 @@ function stripDataPrefix(b64: string): string {
     if (idx >= 0) return s.slice(idx + 1);
   }
   return s;
+}
+
+function toOutboxError(e: any, fallbackMessage: string, code?: string): OutboxError {
+  const msg = e?.message ? String(e.message) : fallbackMessage;
+  return { code, message: msg, at: nowIso() };
 }
 
 function firstLegacyAttachment(item: OutboxItem): PendingAttachment | null {
@@ -91,6 +102,137 @@ async function readBase64FromUri(uri: string): Promise<string> {
   return stripDataPrefix(String(b64 || ""));
 }
 
+async function setItemState(
+  id: string,
+  patch: Partial<OutboxItem> & { status?: OutboxItemStatus }
+): Promise<void> {
+  await updateOutboxItem(id, patch);
+}
+
+async function syncOneInternal(args: {
+  item: OutboxItem;
+  baseUrl: string;
+  tenantSlug: string;
+  timeoutMs: number;
+}): Promise<"OK" | "FAILED" | "SKIPPED"> {
+  const { item, baseUrl, tenantSlug, timeoutMs } = args;
+
+  if (isDemoLead(item)) {
+    await setItemState(item.id, {
+      status: "FAILED",
+      lastError: { code: "DEMO", message: "Demo lead (local only) — delete this item when done testing.", at: nowIso() },
+    });
+    return "SKIPPED";
+  }
+
+  const attemptAt = nowIso();
+  await setItemState(item.id, {
+    status: "SYNCING",
+    lastAttemptAt: attemptAt,
+    lastError: undefined,
+  });
+
+  try {
+    // Preferred: inline card base64 (new flow)
+    let cardImageBase64 = stripDataPrefix(item.cardImageBase64 || "");
+    let cardImageMimeType = String(item.cardImageMimeType || "image/jpeg");
+    let cardImageFilename = String(item.cardImageFilename || "businesscard.jpg");
+
+    // Legacy fallback: attachments[] -> read file base64 and send inline
+    const legacyAtt = !cardImageBase64 ? firstLegacyAttachment(item) : null;
+    if (legacyAtt) {
+      const exists = await localFileExists(legacyAtt.localUri);
+      if (!exists) {
+        const err = { code: "LOCAL_FILE_MISSING", message: "Local attachment file missing.", at: nowIso() };
+
+        const nextAttachments = (item.attachments ?? []).map((a) =>
+          a.id === legacyAtt.id
+            ? {
+                ...a,
+                status: "FAILED" as const,
+                tries: (a.tries ?? 0) + 1,
+                lastError: err.message,
+              }
+            : a
+        );
+
+        await setItemState(item.id, {
+          status: "FAILED",
+          tries: (item.tries ?? 0) + 1,
+          lastError: err,
+          attachments: nextAttachments,
+        });
+
+        return "FAILED";
+      }
+
+      cardImageBase64 = await readBase64FromUri(legacyAtt.localUri);
+      cardImageMimeType = legacyAtt.mimeType || cardImageMimeType;
+      cardImageFilename = legacyAtt.filename || cardImageFilename;
+    }
+
+    // Post lead (JSON)
+    await mobilePostJson({
+      baseUrl,
+      tenantSlug,
+      path: "/api/mobile/v1/leads",
+      timeoutMs: Math.max(timeoutMs, 15000),
+      body: {
+        formId: item.formId,
+        clientLeadId: item.clientLeadId,
+        values: item.values,
+        capturedByDeviceUid: item.capturedByDeviceUid,
+
+        // include only if present (server accepts optional)
+        ...(cardImageBase64
+          ? {
+              cardImageBase64,
+              cardImageMimeType,
+              cardImageFilename,
+            }
+          : {}),
+      },
+    });
+
+    // cleanup legacy local file if we used it
+    if (legacyAtt?.localUri) {
+      await deleteLocalFile(legacyAtt.localUri);
+    }
+
+    await setItemState(item.id, { status: "DONE", lastSuccessAt: nowIso() });
+    await removeOutboxItem(item.id);
+
+    return "OK";
+  } catch (e: any) {
+    const err = toOutboxError(e, "Sync failed");
+
+    // mark legacy attachment as FAILED (keep queued)
+    const legacyAtt = firstLegacyAttachment(item);
+    let nextAttachments = item.attachments;
+    if (legacyAtt && Array.isArray(item.attachments)) {
+      nextAttachments = item.attachments.map((a) =>
+        a.id === legacyAtt.id
+          ? {
+              ...a,
+              status: "FAILED" as const,
+              tries: (a.tries ?? 0) + 1,
+              lastError: err.message,
+            }
+          : a
+      );
+    }
+
+    await setItemState(item.id, {
+      status: "FAILED",
+      tries: (item.tries ?? 0) + 1,
+      lastError: err,
+      attachments: nextAttachments,
+    });
+
+    return "FAILED";
+  }
+}
+
 /**
  * Single entry-point for manual + auto sync.
  * - Mutex prevents parallel runs (manual + auto)
@@ -107,25 +249,25 @@ export async function syncOutboxNow(args: {
   const timeoutMs = args.timeoutMs ?? 8000;
 
   if (__syncMutex) {
-    const finishedAt = new Date().toISOString();
+    const finishedAt = nowIso();
     emitStatus({ syncing: false, skipped: 1, skippedReason: "busy", reason, finishedAt });
     return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (busy)", finishedAt };
   }
 
   if (args.isOnline === false) {
-    const finishedAt = new Date().toISOString();
+    const finishedAt = nowIso();
     emitStatus({ syncing: false, skipped: 1, skippedReason: "offline", reason, finishedAt });
     return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (offline)", finishedAt };
   }
 
   if (!args.baseUrl || !args.tenantSlug) {
-    const finishedAt = new Date().toISOString();
+    const finishedAt = nowIso();
     emitStatus({ syncing: false, skipped: 1, skippedReason: "settings", reason, finishedAt });
     return { ok: 0, failed: 0, skipped: 1, message: "Cannot sync: missing baseUrl/tenantSlug (Settings).", finishedAt };
   }
 
   __syncMutex = true;
-  const startedAt = new Date().toISOString();
+  const startedAt = nowIso();
   emitStatus({ syncing: true, reason, startedAt });
 
   let ok = 0;
@@ -136,136 +278,108 @@ export async function syncOutboxNow(args: {
     const current = await loadOutbox();
 
     if (!current.length) {
-      const finishedAt = new Date().toISOString();
+      const finishedAt = nowIso();
       emitStatus({ syncing: false, reason, startedAt, finishedAt, skipped: 1, skippedReason: "empty" });
       return { ok: 0, failed: 0, skipped: 1, message: "Outbox empty (nothing to sync).", finishedAt };
     }
 
     for (const item of current) {
-      if (isDemoLead(item)) {
-        skipped += 1;
-        await updateOutboxItem(item.id, {
-          lastError: "Demo lead (local only) — delete this item when done testing.",
-        });
-        continue;
-      }
+      const r = await syncOneInternal({
+        item,
+        baseUrl: args.baseUrl,
+        tenantSlug: args.tenantSlug,
+        timeoutMs,
+      });
 
-      try {
-        // Preferred: inline card base64 (new flow)
-        let cardImageBase64 = stripDataPrefix(item.cardImageBase64 || "");
-        let cardImageMimeType = String(item.cardImageMimeType || "image/jpeg");
-        let cardImageFilename = String(item.cardImageFilename || "businesscard.jpg");
-
-        // Legacy fallback: attachments[] -> read file base64 and send inline
-        const legacyAtt = !cardImageBase64 ? firstLegacyAttachment(item) : null;
-        if (legacyAtt) {
-          const exists = await localFileExists(legacyAtt.localUri);
-          if (!exists) {
-            failed += 1;
-
-            const nextAttachments = (item.attachments ?? []).map((a) =>
-              a.id === legacyAtt.id
-                ? {
-                    ...a,
-                    status: "FAILED" as const,
-                    tries: (a.tries ?? 0) + 1,
-                    lastError: "Local attachment file missing.",
-                  }
-                : a
-            );
-
-            await updateOutboxItem(item.id, {
-              tries: (item.tries ?? 0) + 1,
-              lastError: "Local attachment file missing.",
-              attachments: nextAttachments,
-            });
-            continue;
-          }
-
-          cardImageBase64 = await readBase64FromUri(legacyAtt.localUri);
-          cardImageMimeType = legacyAtt.mimeType || cardImageMimeType;
-          cardImageFilename = legacyAtt.filename || cardImageFilename;
-        }
-
-        // Post lead (JSON)
-        await mobilePostJson({
-          baseUrl: args.baseUrl,
-          tenantSlug: args.tenantSlug,
-          path: "/api/mobile/v1/leads",
-          timeoutMs: Math.max(timeoutMs, 15000),
-          body: {
-            formId: item.formId,
-            clientLeadId: item.clientLeadId,
-            values: item.values,
-            capturedByDeviceUid: item.capturedByDeviceUid,
-
-            // include only if present (server accepts optional)
-            ...(cardImageBase64
-              ? {
-                  cardImageBase64,
-                  cardImageMimeType,
-                  cardImageFilename,
-                }
-              : {}),
-          },
-        });
-
-        ok += 1;
-
-        // cleanup legacy local file if we used it
-        if (legacyAtt?.localUri) {
-          await deleteLocalFile(legacyAtt.localUri);
-        }
-
-        await removeOutboxItem(item.id);
-      } catch (e: any) {
-        failed += 1;
-        const msg = e?.message ? String(e.message) : "Sync failed";
-
-        // mark legacy attachment as FAILED (keep queued)
-        const legacyAtt = firstLegacyAttachment(item);
-        let nextAttachments = item.attachments;
-        if (legacyAtt && Array.isArray(item.attachments)) {
-          nextAttachments = item.attachments.map((a) =>
-            a.id === legacyAtt.id
-              ? {
-                  ...a,
-                  status: "FAILED" as const,
-                  tries: (a.tries ?? 0) + 1,
-                  lastError: msg,
-                }
-              : a
-          );
-        }
-
-        await updateOutboxItem(item.id, {
-          tries: (item.tries ?? 0) + 1,
-          lastError: msg,
-          attachments: nextAttachments,
-        });
-      }
+      if (r === "OK") ok += 1;
+      else if (r === "FAILED") failed += 1;
+      else skipped += 1;
     }
 
-    const finishedAt = new Date().toISOString();
+    const finishedAt = nowIso();
     emitStatus({ syncing: false, reason, startedAt, finishedAt, ok, failed, skipped });
     return {
       ok,
       failed,
       skipped,
-      message: `Sync finished: ok=${ok}, failed=${failed}, skipped(demo)=${skipped}`,
+      message: `Sync finished: ok=${ok}, failed=${failed}, skipped=${skipped}`,
       finishedAt,
     };
   } catch (e: any) {
-    const finishedAt = new Date().toISOString();
+    const finishedAt = nowIso();
     const msg = e?.message ? String(e.message) : "Sync error";
-    emitStatus({ syncing: false, reason, startedAt, finishedAt, ok, failed, skipped, error: msg });
-    return {
-      ok,
-      failed: failed + 1,
-      skipped,
-      message: `Sync error: ${msg}`,
-      finishedAt,
-    };
+    emitStatus({ syncing: false, reason, startedAt, finishedAt, error: msg, ok, failed, skipped });
+    return { ok, failed, skipped, message: `Sync error: ${msg}`, finishedAt };
+  } finally {
+    __syncMutex = false;
+  }
+}
+
+/**
+ * Single-item sync (Retry one item). Uses same mutex as syncOutboxNow().
+ */
+export async function syncOutboxOne(args: {
+  itemId: string;
+  baseUrl?: string;
+  tenantSlug?: string;
+  reason?: string; // "retry:<id>"
+  isOnline?: boolean;
+  timeoutMs?: number;
+}): Promise<OutboxSyncSummary> {
+  const reason = args.reason ?? `retry:${args.itemId}`;
+  const timeoutMs = args.timeoutMs ?? 8000;
+
+  if (__syncMutex) {
+    const finishedAt = nowIso();
+    emitStatus({ syncing: false, skipped: 1, skippedReason: "busy", reason, finishedAt });
+    return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (busy)", finishedAt };
+  }
+
+  if (args.isOnline === false) {
+    const finishedAt = nowIso();
+    emitStatus({ syncing: false, skipped: 1, skippedReason: "offline", reason, finishedAt });
+    return { ok: 0, failed: 0, skipped: 1, message: "Sync skipped (offline)", finishedAt };
+  }
+
+  if (!args.baseUrl || !args.tenantSlug) {
+    const finishedAt = nowIso();
+    emitStatus({ syncing: false, skipped: 1, skippedReason: "settings", reason, finishedAt });
+    return { ok: 0, failed: 0, skipped: 1, message: "Cannot sync: missing baseUrl/tenantSlug (Settings).", finishedAt };
+  }
+
+  __syncMutex = true;
+  const startedAt = nowIso();
+  emitStatus({ syncing: true, reason, startedAt });
+
+  try {
+    const current = await loadOutbox();
+    const item = current.find((x) => x.id === args.itemId);
+
+    if (!item) {
+      const finishedAt = nowIso();
+      emitStatus({ syncing: false, reason, startedAt, finishedAt, skipped: 1 });
+      return { ok: 0, failed: 0, skipped: 1, message: "Item not found (already removed).", finishedAt };
+    }
+
+    const r = await syncOneInternal({
+      item,
+      baseUrl: args.baseUrl,
+      tenantSlug: args.tenantSlug,
+      timeoutMs,
+    });
+
+    const finishedAt = nowIso();
+    const ok = r === "OK" ? 1 : 0;
+    const failed = r === "FAILED" ? 1 : 0;
+    const skipped = r === "SKIPPED" ? 1 : 0;
+
+    emitStatus({ syncing: false, reason, startedAt, finishedAt, ok, failed, skipped });
+    return { ok, failed, skipped, message: `Retry finished: ok=${ok}, failed=${failed}, skipped=${skipped}`, finishedAt };
+  } catch (e: any) {
+    const finishedAt = nowIso();
+    const msg = e?.message ? String(e.message) : "Retry error";
+    emitStatus({ syncing: false, reason, startedAt, finishedAt, error: msg });
+    return { ok: 0, failed: 1, skipped: 0, message: `Retry error: ${msg}`, finishedAt };
   } finally {
     __syncMutex = false;
   }
