@@ -43,10 +43,6 @@ function nextPrimaryAction(status: string): { label: string; toStatus: 'DRAFT' |
 }
 
 function normalizeForm(rawData: any): Form {
-  // Accept common shapes:
-  // - { form: {...}, fields: [...] }
-  // - { ...form, fields: [...] }
-  // - { item: {...} }
   const d = rawData;
   if (d?.form) return d.form;
   if (d?.item) return d.item;
@@ -56,15 +52,10 @@ function normalizeForm(rawData: any): Form {
 function normalizeFields(rawData: any): Field[] {
   const d = rawData;
 
-  // Most likely:
-  // - { form: {...}, fields: [...] }
-  // - { fields: [...] }
-  // - { ...form, fields: [...] }
   if (Array.isArray(d?.fields)) return d.fields;
   if (Array.isArray(d?.form?.fields)) return d.form.fields;
   if (Array.isArray(d?.items)) return d.items;
 
-  // Sometimes fields might be nested
   if (Array.isArray(d?.formFields)) return d.formFields;
 
   return [];
@@ -132,7 +123,6 @@ const KEY_REGEX = /^[A-Za-z0-9_-]+$/;
 function suggestKeyFromLabel(label: string): string {
   const raw = String(label || '').trim().toLowerCase();
   if (!raw) return '';
-  // replace non [a-z0-9] by underscore, collapse underscores, trim
   const k = raw
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/_+/g, '_')
@@ -158,7 +148,8 @@ function ModalShell({
           <div>
             <div className="text-lg font-semibold">{title}</div>
             <div className="mt-1 text-xs text-slate-600">
-              Key-Format: <code className="rounded bg-slate-100 px-1 py-0.5">A-Za-z0-9_-</code>
+              Key-Format:{' '}
+              <code className="rounded bg-slate-100 px-1 py-0.5">A-Za-z0-9_-</code>
             </div>
           </div>
           <button
@@ -183,8 +174,8 @@ type FieldDraft = {
   isActive: boolean;
   placeholder: string;
   helpText: string;
-  sortOrder: string; // editable (optional)
-  configText: string; // JSON (optional)
+  sortOrder: string;
+  configText: string;
 };
 
 function makeEmptyDraft(): FieldDraft {
@@ -201,17 +192,17 @@ function makeEmptyDraft(): FieldDraft {
   };
 }
 
-export function FormDetailClient({ formId }: { formId: string }) {
-  const [state, setState] = React.useState<
-    | { status: 'loading' | 'idle' }
-    | { status: 'ok'; form: Form; fields: Field[]; raw: unknown }
-    | { status: 'error'; message: string; raw?: unknown }
-  >({ status: 'idle' });
+type DetailState =
+  | { status: 'loading' | 'idle'; form?: Form; fields?: Field[]; raw?: unknown }
+  | { status: 'ok'; form: Form; fields: Field[]; raw: unknown }
+  | { status: 'error'; message: string; raw?: unknown; form?: Form; fields?: Field[] };
 
-  const [busy, setBusy] = React.useState(false); // status actions
+export function FormDetailClient({ formId }: { formId: string }) {
+  const [state, setState] = React.useState<DetailState>({ status: 'idle' });
+
+  const [busy, setBusy] = React.useState(false);
   const [actionError, setActionError] = React.useState('');
 
-  // Meta editor
   const [metaDraft, setMetaDraft] = React.useState<{ name: string; description: string }>({
     name: '',
     description: '',
@@ -221,7 +212,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
   const [metaError, setMetaError] = React.useState('');
   const [metaOkHint, setMetaOkHint] = React.useState('');
 
-  // Field editor modal
   const [fieldModal, setFieldModal] = React.useState<
     | null
     | { mode: 'create'; draft: FieldDraft; keyTouched: boolean }
@@ -233,7 +223,12 @@ export function FormDetailClient({ formId }: { formId: string }) {
   const [sortError, setSortError] = React.useState('');
 
   async function load() {
-    setState({ status: 'loading' });
+    setState((prev) => ({
+      status: 'loading',
+      form: 'form' in prev ? prev.form : undefined,
+      fields: 'fields' in prev ? prev.fields : undefined,
+      raw: 'raw' in prev ? prev.raw : undefined,
+    }));
 
     const res = await adminFetch<any>(`/api/admin/v1/forms/${encodeURIComponent(formId)}`, {
       method: 'GET',
@@ -247,7 +242,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
           const ao = fieldOrderValue(a);
           const bo = fieldOrderValue(b);
           if (ao !== bo) return ao - bo;
-          // stable tie-breakers
           const ak = String(pickFieldKey(a) || '');
           const bk = String(pickFieldKey(b) || '');
           if (ak !== bk) return ak.localeCompare(bk);
@@ -258,11 +252,13 @@ export function FormDetailClient({ formId }: { formId: string }) {
       return;
     }
 
-    setState({
+    setState((prev) => ({
       status: 'error',
       message: res.error?.message ?? 'Unbekannter Fehler',
       raw: res.raw,
-    });
+      form: 'form' in prev ? prev.form : undefined,
+      fields: 'fields' in prev ? prev.fields : undefined,
+    }));
   }
 
   async function patchStatus(toStatus: 'DRAFT' | 'ACTIVE' | 'ARCHIVED') {
@@ -321,7 +317,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
     await load();
     setMetaBusy(false);
 
-    // small auto-hide hint
     setTimeout(() => setMetaOkHint(''), 1500);
   }
 
@@ -364,7 +359,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
     if (!KEY_REGEX.test(key)) return 'Key ist ungültig. Erlaubt: A-Za-z0-9_-';
     if (!type) return 'Type ist erforderlich.';
 
-    // config JSON check (optional)
     const cfg = String(d.configText || '').trim();
     if (cfg) {
       try {
@@ -374,7 +368,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
       }
     }
 
-    // sortOrder (optional)
     const so = String(d.sortOrder || '').trim();
     if (so) {
       const n = Number(so);
@@ -430,14 +423,11 @@ export function FormDetailClient({ formId }: { formId: string }) {
     if (fieldModal.mode === 'create') {
       const payload = buildFieldPayload(fieldModal.draft);
 
-      const res = await adminFetch<any>(
-        `/api/admin/v1/forms/${encodeURIComponent(formId)}/fields`,
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload),
-        }
-      );
+      const res = await adminFetch<any>(`/api/admin/v1/forms/${encodeURIComponent(formId)}/fields`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
 
       if (!res.ok) {
         setFieldBusy(false);
@@ -451,7 +441,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
       return;
     }
 
-    // edit
     const payload = buildFieldPayload(fieldModal.draft);
     const fieldId = String(fieldModal.field?.id || '').trim();
     if (!fieldId) {
@@ -519,7 +508,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
       if (id) currentById.set(id, typeof f?.sortOrder === 'number' ? f.sortOrder : fieldOrderValue(f));
     }
 
-    // patch fields which changed sortOrder
     for (let i = 0; i < newOrder.length; i++) {
       const f = newOrder[i];
       const id = String(f?.id ?? '');
@@ -542,7 +530,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
       if (!res.ok) {
         setSortBusy(false);
         setSortError(res.error?.message ?? 'Sortierung speichern fehlgeschlagen');
-        // refresh from server to avoid mismatches
         await load();
         return;
       }
@@ -575,7 +562,6 @@ export function FormDetailClient({ formId }: { formId: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formId]);
 
-  // Seed meta editor when form loads/changes (by updatedAt)
   React.useEffect(() => {
     if (state.status !== 'ok') return;
 
@@ -840,8 +826,7 @@ export function FormDetailClient({ formId }: { formId: string }) {
                     const req = pickFieldRequired(fld);
                     const act = pickFieldActive(fld);
                     const id = String(fld?.id ?? '');
-                    const so =
-                      typeof fld?.sortOrder === 'number' ? fld.sortOrder : fieldOrderValue(fld);
+                    const so = typeof fld?.sortOrder === 'number' ? fld.sortOrder : fieldOrderValue(fld);
 
                     return (
                       <tr key={id || idx} className="border-t">
@@ -851,12 +836,8 @@ export function FormDetailClient({ formId }: { formId: string }) {
                           {pickFieldKey(fld) || '—'}
                         </td>
                         <td className="px-3 py-2 text-slate-700">{pickFieldType(fld) || '—'}</td>
-                        <td className="px-3 py-2 text-slate-700">
-                          {req === null ? '—' : req ? 'yes' : 'no'}
-                        </td>
-                        <td className="px-3 py-2 text-slate-700">
-                          {act === null ? '—' : act ? 'yes' : 'no'}
-                        </td>
+                        <td className="px-3 py-2 text-slate-700">{req === null ? '—' : req ? 'yes' : 'no'}</td>
+                        <td className="px-3 py-2 text-slate-700">{act === null ? '—' : act ? 'yes' : 'no'}</td>
                         <td className="px-3 py-2 font-mono text-xs text-slate-700">{so}</td>
                         <td className="px-3 py-2">
                           <div className="flex items-center justify-end gap-2">
@@ -904,9 +885,7 @@ export function FormDetailClient({ formId }: { formId: string }) {
             </div>
           )}
 
-          {sortBusy ? (
-            <div className="mt-3 text-sm text-slate-600">Sortiere…</div>
-          ) : null}
+          {sortBusy ? <div className="mt-3 text-sm text-slate-600">Sortiere…</div> : null}
 
           {sortError ? (
             <div className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
@@ -967,7 +946,9 @@ export function FormDetailClient({ formId }: { formId: string }) {
                 value={fieldModal.draft.key}
                 onChange={(e) => {
                   const key = e.target.value;
-                  setFieldModal((s) => (s ? { ...s, keyTouched: true, draft: { ...s.draft, key } } : s));
+                  setFieldModal((s) =>
+                    s ? { ...s, keyTouched: true, draft: { ...s.draft, key } } : s
+                  );
                 }}
                 className="mt-1 w-full rounded-md border px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-slate-200"
                 placeholder="z.B. firstname"
@@ -985,7 +966,9 @@ export function FormDetailClient({ formId }: { formId: string }) {
               <select
                 value={String(fieldModal.draft.type || 'TEXT').toUpperCase()}
                 onChange={(e) =>
-                  setFieldModal((s) => (s ? { ...s, draft: { ...s.draft, type: e.target.value } } : s))
+                  setFieldModal((s) =>
+                    s ? { ...s, draft: { ...s.draft, type: e.target.value } } : s
+                  )
                 }
                 className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200"
               >
@@ -1036,7 +1019,9 @@ export function FormDetailClient({ formId }: { formId: string }) {
               <input
                 value={fieldModal.draft.placeholder}
                 onChange={(e) =>
-                  setFieldModal((s) => (s ? { ...s, draft: { ...s.draft, placeholder: e.target.value } } : s))
+                  setFieldModal((s) =>
+                    s ? { ...s, draft: { ...s.draft, placeholder: e.target.value } } : s
+                  )
                 }
                 className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200"
                 placeholder="Optional…"
@@ -1048,7 +1033,9 @@ export function FormDetailClient({ formId }: { formId: string }) {
               <input
                 value={fieldModal.draft.helpText}
                 onChange={(e) =>
-                  setFieldModal((s) => (s ? { ...s, draft: { ...s.draft, helpText: e.target.value } } : s))
+                  setFieldModal((s) =>
+                    s ? { ...s, draft: { ...s.draft, helpText: e.target.value } } : s
+                  )
                 }
                 className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-200"
                 placeholder="Optional…"
@@ -1060,7 +1047,9 @@ export function FormDetailClient({ formId }: { formId: string }) {
               <textarea
                 value={fieldModal.draft.configText}
                 onChange={(e) =>
-                  setFieldModal((s) => (s ? { ...s, draft: { ...s.draft, configText: e.target.value } } : s))
+                  setFieldModal((s) =>
+                    s ? { ...s, draft: { ...s.draft, configText: e.target.value } } : s
+                  )
                 }
                 className="mt-1 w-full resize-y rounded-md border px-3 py-2 font-mono text-xs outline-none focus:ring-2 focus:ring-slate-200"
                 rows={6}
@@ -1074,7 +1063,9 @@ export function FormDetailClient({ formId }: { formId: string }) {
               <input
                 value={fieldModal.draft.sortOrder}
                 onChange={(e) =>
-                  setFieldModal((s) => (s ? { ...s, draft: { ...s.draft, sortOrder: e.target.value } } : s))
+                  setFieldModal((s) =>
+                    s ? { ...s, draft: { ...s.draft, sortOrder: e.target.value } } : s
+                  )
                 }
                 className="mt-1 w-full rounded-md border px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-slate-200"
                 placeholder="z.B. 0"
