@@ -7,14 +7,12 @@ import { jsonOk, jsonError } from "@/lib/api";
 import { resolveTenantFromMobileHeaders } from "@/lib/tenant-mobile";
 import { prisma } from "@/lib/db";
 import type { Prisma } from "@prisma/client";
+import { isHttpError, validateBody } from "@/lib/http";
+import { z } from "zod";
 
 export const runtime = "nodejs";
 
 function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
@@ -64,14 +62,19 @@ type ParsedCardImage = {
   bytes: Uint8Array;
 };
 
-function parseCardImage(body: Record<string, unknown>): { ok: true; img: ParsedCardImage } | { ok: false; code: string; message: string } | { ok: true; img: null } {
+function parseCardImage(
+  body: Record<string, unknown>
+):
+  | { ok: true; img: ParsedCardImage }
+  | { ok: false; code: string; message: string }
+  | { ok: true; img: null } {
   // Accept shapes:
   // - cardImageBase64: "data:image/png;base64,..."
   // - cardImage: { base64, mimeType?, filename? }
   const rawBase64 =
     typeof body.cardImageBase64 === "string"
       ? body.cardImageBase64
-      : isPlainObject(body.cardImage) && typeof (body.cardImage as any).base64 === "string"
+      : isRecord(body.cardImage) && typeof (body.cardImage as any).base64 === "string"
         ? String((body.cardImage as any).base64)
         : "";
 
@@ -80,7 +83,7 @@ function parseCardImage(body: Record<string, unknown>): { ok: true; img: ParsedC
   const stripped = stripDataUrlPrefix(rawBase64);
 
   const mimeFromObj =
-    isPlainObject(body.cardImage) && typeof (body.cardImage as any).mimeType === "string"
+    isRecord(body.cardImage) && typeof (body.cardImage as any).mimeType === "string"
       ? String((body.cardImage as any).mimeType).trim()
       : "";
 
@@ -88,7 +91,7 @@ function parseCardImage(body: Record<string, unknown>): { ok: true; img: ParsedC
   if (!mimeType) return { ok: false, code: "CARD_MIME_REQUIRED", message: "cardImage mimeType missing." };
 
   const fnFromObj =
-    isPlainObject(body.cardImage) && typeof (body.cardImage as any).filename === "string"
+    isRecord(body.cardImage) && typeof (body.cardImage as any).filename === "string"
       ? String((body.cardImage as any).filename).trim()
       : "";
 
@@ -109,15 +112,23 @@ function parseCardImage(body: Record<string, unknown>): { ok: true; img: ParsedC
     return { ok: false, code: "CARD_EMPTY", message: "cardImage is empty." };
   }
   if (bytes.byteLength > 1_500_000) {
-    return { ok: false, code: "CARD_TOO_LARGE", message: "cardImage too large (>1.5MB). Please reduce resolution/compression." };
+    return {
+      ok: false,
+      code: "CARD_TOO_LARGE",
+      message: "cardImage too large (>1.5MB). Please reduce resolution/compression.",
+    };
   }
 
   return { ok: true, img: { mimeType, filename, bytes } };
 }
 
-function mergeCardMeta(metaJson: Prisma.InputJsonValue | undefined, nowIso: string, present: boolean) {
-  const base: Record<string, any> = metaJson && isPlainObject(metaJson) ? { ...(metaJson as any) } : {};
-  const card0: Record<string, any> = isPlainObject(base.card) ? { ...(base.card as any) } : {};
+function mergeCardMeta(
+  metaJson: Prisma.InputJsonValue | undefined,
+  nowIso: string,
+  present: boolean
+) {
+  const base: Record<string, any> = metaJson && isRecord(metaJson) ? { ...(metaJson as any) } : {};
+  const card0: Record<string, any> = isRecord(base.card) ? { ...(base.card as any) } : {};
 
   base.card = {
     ...card0,
@@ -230,80 +241,140 @@ export async function POST(req: Request) {
   }
   const tenantId = tenantRes.tenant.id;
 
-  let body: unknown;
   try {
-    body = await req.json();
-  } catch {
-    return jsonError(req, 400, "BAD_JSON", "Invalid JSON body.");
-  }
+    // IMPORTANT: base64 card image makes bodies bigger than 512KB
+    const body = await validateBody(req, z.any(), { maxBytes: 4 * 1024 * 1024 });
 
-  if (!isRecord(body)) {
-    return jsonError(req, 400, "BAD_REQUEST", "Body must be a JSON object.");
-  }
+    if (!isRecord(body)) {
+      return jsonError(req, 400, "BAD_REQUEST", "Body must be a JSON object.");
+    }
 
-  const formId = typeof body.formId === "string" ? body.formId.trim() : "";
-  const clientLeadId = typeof body.clientLeadId === "string" ? body.clientLeadId.trim() : "";
+    const formId = typeof body.formId === "string" ? body.formId.trim() : "";
+    const clientLeadId = typeof body.clientLeadId === "string" ? body.clientLeadId.trim() : "";
 
-  if (!formId) return jsonError(req, 400, "FORM_ID_REQUIRED", "formId is required.");
-  if (!clientLeadId) return jsonError(req, 400, "CLIENT_LEAD_ID_REQUIRED", "clientLeadId is required.");
+    if (!formId) return jsonError(req, 400, "FORM_ID_REQUIRED", "formId is required.");
+    if (!clientLeadId)
+      return jsonError(req, 400, "CLIENT_LEAD_ID_REQUIRED", "clientLeadId is required.");
 
-  const valuesRaw = body.values;
-  if (!isRecord(valuesRaw)) return jsonError(req, 400, "VALUES_REQUIRED", "values must be an object.");
+    const valuesRaw = body.values;
+    if (!isRecord(valuesRaw)) return jsonError(req, 400, "VALUES_REQUIRED", "values must be an object.");
 
-  const valuesJson = toInputJsonValue(valuesRaw);
-  if (!valuesJson) return jsonError(req, 400, "VALUES_NOT_JSON", "values must be JSON-serializable.");
+    const valuesJson = toInputJsonValue(valuesRaw);
+    if (!valuesJson) return jsonError(req, 400, "VALUES_NOT_JSON", "values must be JSON-serializable.");
 
-  // optional meta (object only)
-  const metaRaw = (body as any).meta;
-  let metaJson: Prisma.InputJsonValue | undefined;
-  if (metaRaw !== undefined) {
-    if (!isRecord(metaRaw)) return jsonError(req, 400, "META_INVALID", "meta must be an object.");
-    const m = toInputJsonValue(metaRaw);
-    if (!m) return jsonError(req, 400, "META_NOT_JSON", "meta must be JSON-serializable.");
-    metaJson = m;
-  }
+    // optional meta (object only)
+    const metaRaw = (body as any).meta;
+    let metaJson: Prisma.InputJsonValue | undefined;
+    if (metaRaw !== undefined) {
+      if (!isRecord(metaRaw)) return jsonError(req, 400, "META_INVALID", "meta must be an object.");
+      const m = toInputJsonValue(metaRaw);
+      if (!m) return jsonError(req, 400, "META_NOT_JSON", "meta must be JSON-serializable.");
+      metaJson = m;
+    }
 
-  // Parse inline card image (MVP: base64)
-  const cardParsed = parseCardImage(body);
-  if (!cardParsed.ok) {
-    return jsonError(req, 400, cardParsed.code, cardParsed.message);
-  }
+    // Parse inline card image (MVP: base64)
+    const cardParsed = parseCardImage(body);
+    if (!cardParsed.ok) {
+      return jsonError(req, 400, cardParsed.code, cardParsed.message);
+    }
 
-  const capturedAtRaw = typeof (body as any).capturedAt === "string" ? String((body as any).capturedAt).trim() : "";
-  const capturedByDeviceUid =
-    typeof (body as any).capturedByDeviceUid === "string" ? String((body as any).capturedByDeviceUid).trim() : "";
+    const capturedAtRaw =
+      typeof (body as any).capturedAt === "string" ? String((body as any).capturedAt).trim() : "";
+    const capturedByDeviceUid =
+      typeof (body as any).capturedByDeviceUid === "string"
+        ? String((body as any).capturedByDeviceUid).trim()
+        : "";
 
-  // leak-safe form validation (404 if not in tenant OR not active)
-  const form = await prisma.form.findFirst({
-    where: { id: formId, tenantId, status: "ACTIVE" },
-    select: { id: true, groupId: true },
-  });
-  if (!form) return jsonError(req, 404, "NOT_FOUND", "Form not found.");
+    // leak-safe form validation (404 if not in tenant OR not active)
+    const form = await prisma.form.findFirst({
+      where: { id: formId, tenantId, status: "ACTIVE" },
+      select: { id: true, groupId: true },
+    });
+    if (!form) return jsonError(req, 404, "NOT_FOUND", "Form not found.");
 
-  // capturedAt parsing
-  let capturedAt: Date | undefined;
-  if (capturedAtRaw) {
-    const d = new Date(capturedAtRaw);
-    if (Number.isNaN(d.getTime())) return jsonError(req, 400, "BAD_CAPTURED_AT", "capturedAt must be ISO.");
-    capturedAt = d;
-  }
+    // capturedAt parsing
+    let capturedAt: Date | undefined;
+    if (capturedAtRaw) {
+      const d = new Date(capturedAtRaw);
+      if (Number.isNaN(d.getTime())) return jsonError(req, 400, "BAD_CAPTURED_AT", "capturedAt must be ISO.");
+      capturedAt = d;
+    }
 
-  // Idempotency: existing lead
-  const existing = await prisma.lead.findUnique({
-    where: { tenantId_clientLeadId: { tenantId, clientLeadId } },
-    select: { id: true, capturedAt: true, meta: true },
-  });
+    // Idempotency: existing lead
+    const existing = await prisma.lead.findUnique({
+      where: { tenantId_clientLeadId: { tenantId, clientLeadId } },
+      select: { id: true, capturedAt: true, meta: true },
+    });
 
-  const nowIso = new Date().toISOString();
+    const nowIso = new Date().toISOString();
 
-  if (existing) {
-    let present = await hasBusinessCardAttachment(tenantId, existing.id);
+    if (existing) {
+      let present = await hasBusinessCardAttachment(tenantId, existing.id);
 
-    // If client re-sends inline card image and lead has no card yet -> attach now
-    if (!present && cardParsed.img) {
-      await createBusinessCardAttachment({
+      // If client re-sends inline card image and lead has no card yet -> attach now
+      if (!present && cardParsed.img) {
+        await createBusinessCardAttachment({
+          tenantId,
+          leadId: existing.id,
+          mimeType: cardParsed.img.mimeType,
+          filename: cardParsed.img.filename,
+          bytes: cardParsed.img.bytes,
+        });
+        present = true;
+
+        // update meta.card.present
+        const metaWithCard = mergeCardMeta((existing.meta as any) ?? undefined, nowIso, true);
+        await prisma.lead.update({ where: { id: existing.id }, data: { meta: metaWithCard } });
+      }
+
+      return jsonOk(req, {
+        id: existing.id,
+        created: false,
+        capturedAt: existing.capturedAt.toISOString(),
+        attachment: { required: true, present },
+      });
+    }
+
+    // Optional device linkage: tenantId+deviceUid unique
+    let capturedByDeviceId: string | undefined;
+    if (capturedByDeviceUid) {
+      const device = await prisma.device.upsert({
+        where: { tenantId_deviceUid: { tenantId, deviceUid: capturedByDeviceUid } },
+        update: {},
+        create: {
+          tenantId,
+          deviceUid: capturedByDeviceUid,
+          platform: "ANDROID", // MVP default
+        },
+        select: { id: true },
+      });
+      capturedByDeviceId = device.id;
+    }
+
+    // every lead starts with card required; present flips to true once saved
+    const metaWithCardRequired = mergeCardMeta(metaJson, nowIso, false);
+
+    const created = await prisma.lead.create({
+      data: {
         tenantId,
-        leadId: existing.id,
+        formId: form.id,
+        groupId: form.groupId ?? null,
+        clientLeadId,
+        values: valuesJson,
+        meta: metaWithCardRequired,
+        capturedAt: capturedAt ?? undefined,
+        capturedByDeviceId: capturedByDeviceId ?? null,
+      },
+      select: { id: true, capturedAt: true },
+    });
+
+    let present = false;
+    let attachmentDto: any = null;
+
+    if (cardParsed.img) {
+      attachmentDto = await createBusinessCardAttachment({
+        tenantId,
+        leadId: created.id,
         mimeType: cardParsed.img.mimeType,
         filename: cardParsed.img.filename,
         bytes: cardParsed.img.bytes,
@@ -311,74 +382,22 @@ export async function POST(req: Request) {
       present = true;
 
       // update meta.card.present
-      const metaWithCard = mergeCardMeta((existing.meta as any) ?? undefined, nowIso, true);
-      await prisma.lead.update({ where: { id: existing.id }, data: { meta: metaWithCard } });
+      const metaPresent = mergeCardMeta(metaJson, new Date().toISOString(), true);
+      await prisma.lead.update({ where: { id: created.id }, data: { meta: metaPresent } });
     }
 
     return jsonOk(req, {
-      id: existing.id,
-      created: false,
-      capturedAt: existing.capturedAt.toISOString(),
+      id: created.id,
+      created: true,
+      capturedAt: created.capturedAt.toISOString(),
       attachment: { required: true, present },
+      attachmentSaved: attachmentDto ?? null,
     });
+  } catch (err) {
+    if (isHttpError(err)) {
+      return jsonError(req, err.status, err.code, err.message, err.details);
+    }
+    console.error("mobile lead create failed", err);
+    return jsonError(req, 500, "INTERNAL_ERROR", "Unexpected error.");
   }
-
-  // Optional device linkage: tenantId+deviceUid unique
-  let capturedByDeviceId: string | undefined;
-  if (capturedByDeviceUid) {
-    const device = await prisma.device.upsert({
-      where: { tenantId_deviceUid: { tenantId, deviceUid: capturedByDeviceUid } },
-      update: {},
-      create: {
-        tenantId,
-        deviceUid: capturedByDeviceUid,
-        platform: "ANDROID", // MVP default
-      },
-      select: { id: true },
-    });
-    capturedByDeviceId = device.id;
-  }
-
-  // every lead starts with card required; present flips to true once saved
-  const metaWithCardRequired = mergeCardMeta(metaJson, nowIso, false);
-
-  const created = await prisma.lead.create({
-    data: {
-      tenantId,
-      formId: form.id,
-      groupId: form.groupId ?? null,
-      clientLeadId,
-      values: valuesJson,
-      meta: metaWithCardRequired,
-      capturedAt: capturedAt ?? undefined,
-      capturedByDeviceId: capturedByDeviceId ?? null,
-    },
-    select: { id: true, capturedAt: true },
-  });
-
-  let present = false;
-  let attachmentDto: any = null;
-
-  if (cardParsed.img) {
-    attachmentDto = await createBusinessCardAttachment({
-      tenantId,
-      leadId: created.id,
-      mimeType: cardParsed.img.mimeType,
-      filename: cardParsed.img.filename,
-      bytes: cardParsed.img.bytes,
-    });
-    present = true;
-
-    // update meta.card.present
-    const metaPresent = mergeCardMeta(metaJson, new Date().toISOString(), true);
-    await prisma.lead.update({ where: { id: created.id }, data: { meta: metaPresent } });
-  }
-
-  return jsonOk(req, {
-    id: created.id,
-    created: true,
-    capturedAt: created.capturedAt.toISOString(),
-    attachment: { required: true, present },
-    attachmentSaved: attachmentDto ?? null,
-  });
 }
