@@ -2,32 +2,27 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Prisma } from "@prisma/client";
+import { z } from "zod";
 import prisma from "@/lib/prisma";
 import { requireTenantContext } from "@/lib/auth";
 import { jsonError, jsonOk } from "@/lib/api";
+import { httpError, isHttpError, validateBody } from "@/lib/http";
 
 export const runtime = "nodejs";
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
+const ExportCsvBodySchema = z.object({
+  formId: z.string().min(1),
+  groupId: z.string().min(1).optional().nullable(),
+  recipientListId: z.string().min(1).optional().nullable(),
+  includeDeleted: z.boolean().optional(),
+  from: z.string().min(1).optional(),
+  to: z.string().min(1).optional(),
+});
 
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === "string" && v.trim().length > 0;
-}
-
-function parseBool(v: unknown): boolean | null {
-  if (v === true || v === false) return v;
-  if (typeof v !== "string") return null;
-  const t = v.trim().toLowerCase();
-  if (t === "1" || t === "true" || t === "yes" || t === "ja") return true;
-  if (t === "0" || t === "false" || t === "no" || t === "nein") return false;
-  return null;
-}
-
-function parseFrom(v: unknown): Date | null {
-  if (!isNonEmptyString(v)) return null;
+function parseFrom(v: string | undefined): Date | null {
+  if (!v) return null;
   const t = v.trim();
+  if (!t) return null;
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) {
     const d = new Date(`${t}T00:00:00.000Z`);
@@ -38,9 +33,10 @@ function parseFrom(v: unknown): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function parseTo(v: unknown): { lt?: Date; lte?: Date } | null {
-  if (!isNonEmptyString(v)) return null;
+function parseTo(v: string | undefined): { lt?: Date; lte?: Date } | null {
+  if (!v) return null;
   const t = v.trim();
+  if (!t) return null;
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) {
     const start = new Date(`${t}T00:00:00.000Z`);
@@ -72,16 +68,14 @@ function deChHumanDate(date: Date): string {
 }
 
 function yesNo(v: unknown): string {
-  const b =
-    v === true
-      ? true
-      : v === false
-        ? false
-        : typeof v === "string"
-          ? ["1", "true", "yes", "ja"].includes(v.trim().toLowerCase())
-          : Boolean(v);
-
-  return b ? "ja" : "nein";
+  if (v === true) return "ja";
+  if (v === false) return "nein";
+  if (typeof v === "string") {
+    const t = v.trim().toLowerCase();
+    if (["1", "true", "yes", "ja"].includes(t)) return "ja";
+    if (["0", "false", "no", "nein"].includes(t)) return "nein";
+  }
+  return Boolean(v) ? "ja" : "nein";
 }
 
 function csvEscape(v: unknown): string {
@@ -104,7 +98,10 @@ function normalizeMultiSelect(v: unknown): string {
   return "";
 }
 
-function valueToStringForFieldType(fieldType: string, v: unknown): { human: string; iso?: string } {
+function valueToStringForFieldType(
+  fieldType: string,
+  v: unknown
+): { human: string; iso?: string } {
   switch (fieldType) {
     case "CHECKBOX":
       return { human: yesNo(v) };
@@ -129,110 +126,90 @@ function valueToStringForFieldType(fieldType: string, v: unknown): { human: stri
   }
 }
 
-function safeFilename(s: string): string {
-  return s
-    .trim()
-    .replace(/[^\w\-]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
+function makeStorageKey(tenantId: string, jobId: string): string {
+  // DB should store a RELATIVE key (stable across environments)
+  // Always store as posix-ish path to avoid Windows backslashes in DB.
+  return [".tmp_exports", tenantId, `export_${jobId}.csv`].join("/");
 }
 
 export async function POST(req: Request) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  let body: unknown;
+  let jobId: string | null = null;
+
   try {
-    body = await req.json();
-  } catch {
-    return jsonError(req, 400, "BAD_JSON", "Invalid JSON body.");
-  }
-  if (!isRecord(body)) {
-    return jsonError(req, 400, "BAD_REQUEST", "Body must be a JSON object.");
-  }
+    const body = await validateBody(req, ExportCsvBodySchema);
 
-  const formId = isNonEmptyString(body.formId) ? body.formId.trim() : "";
-  if (!formId) {
-    return jsonError(req, 400, "FORM_ID_REQUIRED", "formId is required.");
-  }
+    const formId = body.formId.trim();
+    const groupId = body.groupId ? body.groupId.trim() : null;
+    const recipientListId = body.recipientListId ? body.recipientListId.trim() : null;
+    const includeDeleted = body.includeDeleted ?? false;
 
-  const groupId = isNonEmptyString(body.groupId) ? body.groupId.trim() : null;
+    const from = parseFrom(body.from);
+    if (body.from !== undefined && !from) {
+      throw httpError(400, "BAD_REQUEST", "from must be ISO date/time or YYYY-MM-DD.");
+    }
 
-  const includeDeletedRaw = parseBool((body as any).includeDeleted);
-  if ((body as any).includeDeleted !== undefined && includeDeletedRaw === null) {
-    return jsonError(req, 400, "BAD_REQUEST", "includeDeleted must be boolean.");
-  }
-  const includeDeleted = includeDeletedRaw === true;
+    const toParsed = parseTo(body.to);
+    if (body.to !== undefined && !toParsed) {
+      throw httpError(400, "BAD_REQUEST", "to must be ISO date/time or YYYY-MM-DD.");
+    }
 
-  const from = parseFrom((body as any).from);
-  if ((body as any).from !== undefined && !from) {
-    return jsonError(req, 400, "BAD_REQUEST", "from must be ISO date/time or YYYY-MM-DD.");
-  }
-
-  const toParsed = parseTo((body as any).to);
-  if ((body as any).to !== undefined && !toParsed) {
-    return jsonError(req, 400, "BAD_REQUEST", "to must be ISO date/time or YYYY-MM-DD.");
-  }
-
-  const recipientListId = isNonEmptyString((body as any).recipientListId)
-    ? String((body as any).recipientListId).trim()
-    : null;
-
-  // leak-safe: form + optional group + optional recipientList
-  const form = await prisma.form.findFirst({
-    where: { id: formId, tenantId: scoped.ctx.tenantId },
-    select: { id: true, name: true, groupId: true },
-  });
-  if (!form) return jsonError(req, 404, "NOT_FOUND", "Form not found.");
-
-  if (groupId) {
-    const g = await prisma.group.findFirst({
-      where: { id: groupId, tenantId: scoped.ctx.tenantId },
+    // leak-safe: form + optional group + optional recipientList
+    const form = await prisma.form.findFirst({
+      where: { id: formId, tenantId: scoped.ctx.tenantId },
       select: { id: true, name: true },
     });
-    if (!g) return jsonError(req, 404, "NOT_FOUND", "Group not found.");
-  }
+    if (!form) throw httpError(404, "NOT_FOUND", "Form not found.");
 
-  if (recipientListId) {
-    const rl = await prisma.recipientList.findFirst({
-      where: { id: recipientListId, tenantId: scoped.ctx.tenantId },
+    if (groupId) {
+      const g = await prisma.group.findFirst({
+        where: { id: groupId, tenantId: scoped.ctx.tenantId },
+        select: { id: true },
+      });
+      if (!g) throw httpError(404, "NOT_FOUND", "Group not found.");
+    }
+
+    if (recipientListId) {
+      const rl = await prisma.recipientList.findFirst({
+        where: { id: recipientListId, tenantId: scoped.ctx.tenantId },
+        select: { id: true },
+      });
+      if (!rl) throw httpError(404, "NOT_FOUND", "Recipient list not found.");
+    }
+
+    const params: Prisma.InputJsonValue = {
+      formId,
+      groupId,
+      from: from ? from.toISOString() : null,
+      to: toParsed?.lt ? toParsed.lt.toISOString() : toParsed?.lte ? toParsed.lte.toISOString() : null,
+      includeDeleted,
+      recipientListId,
+    };
+
+    // Create job first
+    const created = await prisma.exportJob.create({
+      data: {
+        tenantId: scoped.ctx.tenantId,
+        type: "CSV",
+        status: "QUEUED",
+        formId: form.id,
+        recipientListId,
+        requestedByUserId: scoped.ctx.user.id,
+        params,
+        queuedAt: new Date(),
+      },
       select: { id: true },
     });
-    if (!rl) return jsonError(req, 404, "NOT_FOUND", "Recipient list not found.");
-  }
+    jobId = created.id;
 
-  const params = {
-    formId,
-    groupId,
-    from: from ? from.toISOString() : null,
-    to: toParsed?.lt ? toParsed.lt.toISOString() : toParsed?.lte ? toParsed.lte.toISOString() : null,
-    includeDeleted,
-    recipientListId,
-  };
+    const startedAt = new Date();
+    await prisma.exportJob.update({
+      where: { id: jobId },
+      data: { status: "RUNNING", startedAt },
+    });
 
-  // Create job first
-  const job = await prisma.exportJob.create({
-    data: {
-      tenantId: scoped.ctx.tenantId,
-      type: "CSV",
-      status: "QUEUED",
-      formId: form.id,
-      recipientListId: recipientListId ?? null,
-      requestedByUserId: scoped.ctx.user.id,
-      params: params as any,
-      queuedAt: new Date(),
-    },
-    select: { id: true },
-  });
-
-  const startedAt = new Date();
-  await prisma.exportJob.update({
-    where: { id: job.id },
-    data: { status: "RUNNING", startedAt },
-  });
-
-  try {
     // fields for dynamic columns (stable order)
     const fields = await prisma.formField.findMany({
       where: { tenantId: scoped.ctx.tenantId, formId: form.id, isActive: true },
@@ -294,11 +271,10 @@ export async function POST(req: Request) {
     }
 
     const headerLine = [...baseHeaders, ...fieldHeaders].map(csvEscape).join(";");
-
     const lines: string[] = [headerLine];
 
     for (const l of leads) {
-      const values = (l.values ?? {}) as any;
+      const values = (l.values ?? {}) as Record<string, unknown>;
 
       const hasCard =
         Array.isArray(l.attachments) &&
@@ -316,7 +292,7 @@ export async function POST(req: Request) {
 
       const fieldCols: string[] = [];
       for (const f of fields) {
-        const raw = values?.[f.key];
+        const raw = values[f.key];
         const { human, iso } = valueToStringForFieldType(f.type, raw);
         fieldCols.push(human ?? "");
         if (f.type === "DATE" || f.type === "DATETIME") {
@@ -331,19 +307,18 @@ export async function POST(req: Request) {
     const csv = bom + lines.join("\r\n") + "\r\n";
 
     // Write local tmp file (MVP storage stub)
-    const dir = path.join(process.cwd(), ".tmp_exports", scoped.ctx.tenantId);
-    fs.mkdirSync(dir, { recursive: true });
-
-    const filePath = path.join(dir, `export_${job.id}.csv`);
-    fs.writeFileSync(filePath, csv, { encoding: "utf8" });
+    const storageKey = makeStorageKey(scoped.ctx.tenantId, jobId);
+    const absPath = path.join(process.cwd(), storageKey);
+    fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    fs.writeFileSync(absPath, csv, { encoding: "utf8" });
 
     const finishedAt = new Date();
     await prisma.exportJob.update({
-      where: { id: job.id },
+      where: { id: jobId },
       data: {
         status: "DONE",
         finishedAt,
-        resultStorageKey: filePath,
+        resultStorageKey: storageKey,
         resultUrl: null,
         error: null,
       },
@@ -358,11 +333,11 @@ export async function POST(req: Request) {
           actorUserId: scoped.ctx.user.id,
           action: "EXPORT_CSV_CREATED",
           entityType: "EXPORT_JOB",
-          entityId: job.id,
+          entityId: jobId,
           meta: {
             params,
             leadCount: leads.length,
-            filePath,
+            storageKey,
           },
         },
       });
@@ -373,42 +348,48 @@ export async function POST(req: Request) {
     return jsonOk(
       req,
       {
-        id: job.id,
+        id: jobId,
         status: "DONE",
-        downloadUrl: `/api/admin/v1/exports/${job.id}/download`,
-        file: {
-          separator: ";",
-          bom: true,
-        },
+        downloadUrl: `/api/admin/v1/exports/${jobId}/download`,
+        file: { separator: ";", bom: true },
       },
       { status: 201 }
     );
-  } catch (e: any) {
-    const finishedAt = new Date();
-    await prisma.exportJob.update({
-      where: { id: job.id },
-      data: {
-        status: "FAILED",
-        finishedAt,
-        error: String(e?.message || "Export failed."),
-      },
-    });
+  } catch (err: unknown) {
+    // If job was created, mark as FAILED (best effort)
+    if (jobId) {
+      try {
+        await prisma.exportJob.update({
+          where: { id: jobId },
+          data: {
+            status: "FAILED",
+            finishedAt: new Date(),
+            error: isHttpError(err) ? err.message : String((err as any)?.message || "Export failed."),
+          },
+        });
+      } catch {
+        // ignore
+      }
 
-    // AuditEvent (best effort)
-    try {
-      await prisma.auditEvent.create({
-        data: {
-          tenantId: scoped.ctx.tenantId,
-          actorType: "USER",
-          actorUserId: scoped.ctx.user.id,
-          action: "EXPORT_CSV_FAILED",
-          entityType: "EXPORT_JOB",
-          entityId: job.id,
-          meta: { params, error: String(e?.message || "") },
-        },
-      });
-    } catch {
-      // ignore
+      try {
+        await prisma.auditEvent.create({
+          data: {
+            tenantId: scoped.ctx.tenantId,
+            actorType: "USER",
+            actorUserId: scoped.ctx.user.id,
+            action: "EXPORT_CSV_FAILED",
+            entityType: "EXPORT_JOB",
+            entityId: jobId,
+            meta: { error: isHttpError(err) ? err.message : String((err as any)?.message || "") },
+          },
+        });
+      } catch {
+        // ignore
+      }
+    }
+
+    if (isHttpError(err)) {
+      return jsonError(req, err.status, err.code, err.message, err.details);
     }
 
     return jsonError(req, 500, "INTERNAL_ERROR", "CSV export failed.");

@@ -65,3 +65,5 @@ export async function adminFetch<T>(
 
   return { ok: false, status: res.status, error, raw: json };
 }
+
+export default adminFetch;
