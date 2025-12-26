@@ -1,18 +1,23 @@
 // app/api/admin/v1/recipients/[id]/entries/[entryId]/route.ts
+import { NextRequest } from "next/server";
 import prisma from "@/lib/prisma";
 import { requireTenantContext } from "@/lib/auth";
 import { jsonError, jsonOk } from "@/lib/api";
 
 export const runtime = "nodejs";
 
-function getIdsFromCtxOrUrl(
+async function getIdsFromCtxOrUrl(
   req: Request,
-  ctx?: { params?: { id?: string; entryId?: string } }
-): { recipientListId: string; entryId: string } {
-  const rid = ctx?.params?.id?.trim() || "";
-  const eid = ctx?.params?.entryId?.trim() || "";
-
-  if (rid && eid) return { recipientListId: rid, entryId: eid };
+  ctx: { params: Promise<{ id: string; entryId: string }> }
+): Promise<{ recipientListId: string; entryId: string }> {
+  try {
+    const p = await ctx.params;
+    const rid = typeof p?.id === "string" ? p.id.trim() : "";
+    const eid = typeof p?.entryId === "string" ? p.entryId.trim() : "";
+    if (rid && eid) return { recipientListId: rid, entryId: eid };
+  } catch {
+    // ignore
+  }
 
   // Fallback: /api/admin/v1/recipients/{id}/entries/{entryId}
   try {
@@ -29,13 +34,13 @@ function getIdsFromCtxOrUrl(
 }
 
 export async function DELETE(
-  req: Request,
-  ctx: { params?: { id?: string; entryId?: string } }
+  req: NextRequest,
+  ctx: { params: Promise<{ id: string; entryId: string }> }
 ) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const { recipientListId, entryId } = getIdsFromCtxOrUrl(req, ctx);
+  const { recipientListId, entryId } = await getIdsFromCtxOrUrl(req, ctx);
   if (!recipientListId) {
     return jsonError(req, 400, "INVALID_PARAMS", "Missing recipient list id.");
   }

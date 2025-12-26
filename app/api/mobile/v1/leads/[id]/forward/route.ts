@@ -1,4 +1,5 @@
 // app/api/mobile/v1/leads/[id]/forward/route.ts
+import { NextRequest } from "next/server";
 import { jsonError, jsonOk } from "@/lib/api";
 import { resolveTenantFromMobileHeaders } from "@/lib/tenant-mobile";
 import { prisma } from "@/lib/db";
@@ -21,12 +22,17 @@ function looksLikeEmail(v: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 }
 
-function leadIdFromCtxOrUrl(
+async function leadIdFromCtxOrUrl(
   req: Request,
-  ctx?: { params?: { id?: string } }
-): string {
-  const fromCtx = ctx?.params?.id?.trim();
-  if (fromCtx) return fromCtx;
+  ctx: { params: Promise<{ id: string }> }
+): Promise<string> {
+  try {
+    const p = await ctx.params;
+    const fromCtx = typeof p?.id === "string" ? p.id.trim() : "";
+    if (fromCtx) return fromCtx;
+  } catch {
+    // ignore
+  }
 
   try {
     const u = new URL(req.url);
@@ -46,13 +52,13 @@ function getIp(req: Request): string | null {
   return xri || null;
 }
 
-export async function POST(req: Request, ctx: { params?: { id?: string } }) {
+export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const tenantRes = await resolveTenantFromMobileHeaders(prisma, req.headers);
   if (!tenantRes.ok) {
     return jsonError(req, tenantRes.status, tenantRes.code, tenantRes.message);
   }
 
-  const leadId = leadIdFromCtxOrUrl(req, ctx);
+  const leadId = await leadIdFromCtxOrUrl(req, ctx);
   if (!leadId) {
     return jsonError(req, 400, "INVALID_PARAMS", "Missing lead id.");
   }
@@ -100,7 +106,7 @@ export async function POST(req: Request, ctx: { params?: { id?: string } }) {
 
   // Resolve recipients
   let sentTo: string[] = [];
-  let mode: "stub" = "stub";
+  const mode: "stub" = "stub";
 
   if (recipientListId) {
     const list = await prisma.recipientList.findFirst({
@@ -119,9 +125,7 @@ export async function POST(req: Request, ctx: { params?: { id?: string } }) {
 
     sentTo = entries.map((e) => normalizeEmail(e.email)).filter((e) => looksLikeEmail(e));
   } else {
-    sentTo = emailsInput
-      .map((e) => normalizeEmail(e))
-      .filter((e) => looksLikeEmail(e));
+    sentTo = emailsInput.map((e) => normalizeEmail(e)).filter((e) => looksLikeEmail(e));
   }
 
   // de-dupe + cap (MVP safety)

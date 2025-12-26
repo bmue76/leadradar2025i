@@ -1,4 +1,5 @@
-import { ZodError, ZodTypeAny } from "zod";
+import { ZodError, ZodIssue, ZodTypeAny } from "zod";
+import type { output } from "zod";
 
 export type QueryRecord = Record<string, string | string[]>;
 
@@ -74,21 +75,23 @@ export function parseQuery(input: Request | string): { url: URL; query: QueryRec
   const url = typeof input === "string" ? new URL(input) : new URL(input.url);
 
   const query: QueryRecord = {};
-  for (const key of url.searchParams.keys()) {
-    const all = url.searchParams.getAll(key);
-    if (all.length <= 1) query[key] = all[0] ?? "";
-    else query[key] = all;
-  }
+  // Avoid iterator-based for..of (no downlevelIteration needed)
+  url.searchParams.forEach((value, key) => {
+    const existing = query[key];
+    if (existing === undefined) query[key] = value;
+    else if (Array.isArray(existing)) existing.push(value);
+    else query[key] = [existing, value];
+  });
 
   return { url, query };
 }
 
 function zodDetails(err: ZodError) {
   return {
-    issues: err.issues.map((i) => ({
+    issues: err.issues.map((i: ZodIssue) => ({
       path: i.path,
       message: i.message,
-      code: i.code,
+      code: String(i.code),
     })),
   };
 }
@@ -101,7 +104,7 @@ export async function validateBody<TSchema extends ZodTypeAny>(
   req: Request,
   schema: TSchema,
   opts?: { maxBytes?: number }
-): Promise<ReturnType<TSchema["parse"]>> {
+): Promise<output<TSchema>> {
   const data = await parseJson(req, { maxBytes: opts?.maxBytes });
   const res = schema.safeParse(data);
 
@@ -109,7 +112,7 @@ export async function validateBody<TSchema extends ZodTypeAny>(
     throw httpError(400, "INVALID_BODY", "Request body validation failed.", zodDetails(res.error));
   }
 
-  return res.data;
+  return res.data as output<TSchema>;
 }
 
 /**
@@ -119,7 +122,7 @@ export async function validateBody<TSchema extends ZodTypeAny>(
 export function validateQuery<TSchema extends ZodTypeAny>(
   input: Request | string,
   schema: TSchema
-): ReturnType<TSchema["parse"]> {
+): output<TSchema> {
   const { query } = parseQuery(input);
   const res = schema.safeParse(query);
 
@@ -127,5 +130,5 @@ export function validateQuery<TSchema extends ZodTypeAny>(
     throw httpError(400, "INVALID_QUERY", "Query validation failed.", zodDetails(res.error));
   }
 
-  return res.data;
+  return res.data as output<TSchema>;
 }

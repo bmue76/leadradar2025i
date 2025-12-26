@@ -1,4 +1,5 @@
 import { Prisma } from "@prisma/client";
+import { NextRequest } from "next/server";
 import prisma from "@/lib/prisma";
 import { requireTenantContext } from "@/lib/auth";
 import { jsonError, jsonOk } from "@/lib/api";
@@ -30,11 +31,35 @@ function getUserAgent(req: Request): string | null {
   return ua || null;
 }
 
-export async function PATCH(req: Request, { params }: { params: { id: string } }) {
+async function recipientListIdFromCtxOrUrl(
+  req: Request,
+  ctx: { params: Promise<{ id: string }> }
+): Promise<string> {
+  try {
+    const p = await ctx.params;
+    const fromCtx = typeof p?.id === "string" ? p.id.trim() : "";
+    if (fromCtx) return fromCtx;
+  } catch {
+    // ignore
+  }
+
+  // Fallback: /api/admin/v1/recipients/{id}
+  try {
+    const u = new URL(req.url);
+    const parts = u.pathname.split("/").filter(Boolean);
+    const idx = parts.lastIndexOf("recipients");
+    if (idx >= 0 && parts[idx + 1]) return String(parts[idx + 1]).trim();
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const id = params.id?.trim();
+  const id = await recipientListIdFromCtxOrUrl(req, ctx);
   if (!id) return jsonError(req, 400, "INVALID_PARAMS", "Missing recipient list id.");
 
   let body: any;
@@ -166,11 +191,11 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   }
 }
 
-export async function DELETE(req: Request, { params }: { params: { id: string } }) {
+export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const id = params.id?.trim();
+  const id = await recipientListIdFromCtxOrUrl(req, ctx);
   if (!id) return jsonError(req, 400, "INVALID_PARAMS", "Missing recipient list id.");
 
   const ip = getIp(req);

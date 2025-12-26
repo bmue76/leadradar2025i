@@ -1,4 +1,5 @@
 // app/api/admin/v1/recipients/[id]/entries/route.ts
+import { NextRequest } from "next/server";
 import prisma from "@/lib/prisma";
 import { requireTenantContext } from "@/lib/auth";
 import { jsonError, jsonOk } from "@/lib/api";
@@ -21,9 +22,17 @@ function looksLikeEmail(v: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 }
 
-function getListIdFromCtxOrUrl(req: Request, ctx?: { params?: { id?: string } }): string {
-  const fromCtx = ctx?.params?.id?.trim();
-  if (fromCtx) return fromCtx;
+async function getListIdFromCtxOrUrl(
+  req: Request,
+  ctx: { params: Promise<{ id: string }> }
+): Promise<string> {
+  try {
+    const p = await ctx.params;
+    const fromCtx = typeof p?.id === "string" ? p.id.trim() : "";
+    if (fromCtx) return fromCtx;
+  } catch {
+    // ignore
+  }
 
   // Fallback: /api/admin/v1/recipients/{id}/entries
   try {
@@ -37,11 +46,11 @@ function getListIdFromCtxOrUrl(req: Request, ctx?: { params?: { id?: string } })
   return "";
 }
 
-export async function GET(req: Request, ctx: { params?: { id?: string } }) {
+export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const recipientListId = getListIdFromCtxOrUrl(req, ctx);
+  const recipientListId = await getListIdFromCtxOrUrl(req, ctx);
   if (!recipientListId) {
     return jsonError(req, 400, "INVALID_PARAMS", "Missing recipient list id.");
   }
@@ -69,11 +78,11 @@ export async function GET(req: Request, ctx: { params?: { id?: string } }) {
   });
 }
 
-export async function POST(req: Request, ctx: { params?: { id?: string } }) {
+export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const recipientListId = getListIdFromCtxOrUrl(req, ctx);
+  const recipientListId = await getListIdFromCtxOrUrl(req, ctx);
   if (!recipientListId) {
     return jsonError(req, 400, "INVALID_PARAMS", "Missing recipient list id.");
   }

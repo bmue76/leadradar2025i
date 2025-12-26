@@ -1,4 +1,5 @@
 import { Prisma } from "@prisma/client";
+import { NextRequest } from "next/server";
 import prisma from "@/lib/prisma";
 import { requireTenantContext } from "@/lib/auth";
 import { jsonError, jsonOk } from "@/lib/api";
@@ -73,14 +74,19 @@ function getUserAgent(req: Request): string | null {
   return ua || null;
 }
 
-function leadIdFromCtxOrUrl(
+async function leadIdFromCtxOrUrl(
   req: Request,
-  ctx?: { params?: { id?: string } }
-): string {
-  const fromCtx = ctx?.params?.id?.trim();
-  if (fromCtx) return fromCtx;
+  ctx: { params: Promise<{ id: string }> }
+): Promise<string> {
+  try {
+    const p = await ctx.params;
+    const fromCtx = typeof p?.id === "string" ? p.id.trim() : "";
+    if (fromCtx) return fromCtx;
+  } catch {
+    // ignore
+  }
 
-  // Fallback: parse from URL path (robust against missing ctx.params)
+  // Fallback: parse from URL path (robust against any ctx issues)
   try {
     const u = new URL(req.url);
     const parts = u.pathname.split("/").filter(Boolean);
@@ -112,11 +118,11 @@ async function findLeadOr404(req: Request, tenantId: string, id: string) {
   return { ok: true as const, lead };
 }
 
-export async function GET(req: Request, ctx: { params?: { id?: string } }) {
+export async function GET(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const id = leadIdFromCtxOrUrl(req, ctx);
+  const id = await leadIdFromCtxOrUrl(req, ctx);
   if (!id) return jsonError(req, 400, "INVALID_PARAMS", "Missing lead id.");
 
   const found = await findLeadOr404(req, scoped.ctx.tenantId, id);
@@ -174,11 +180,11 @@ export async function GET(req: Request, ctx: { params?: { id?: string } }) {
   return jsonOk(req, payload);
 }
 
-export async function PATCH(req: Request, ctx: { params?: { id?: string } }) {
+export async function PATCH(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const id = leadIdFromCtxOrUrl(req, ctx);
+  const id = await leadIdFromCtxOrUrl(req, ctx);
   if (!id) return jsonError(req, 400, "INVALID_PARAMS", "Missing lead id.");
 
   let body: any;
@@ -277,11 +283,11 @@ export async function PATCH(req: Request, ctx: { params?: { id?: string } }) {
   }
 }
 
-export async function DELETE(req: Request, ctx: { params?: { id?: string } }) {
+export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   const scoped = await requireTenantContext(req);
   if (!scoped.ok) return scoped.res;
 
-  const id = leadIdFromCtxOrUrl(req, ctx);
+  const id = await leadIdFromCtxOrUrl(req, ctx);
   if (!id) return jsonError(req, 400, "INVALID_PARAMS", "Missing lead id.");
 
   let body: any = null;
