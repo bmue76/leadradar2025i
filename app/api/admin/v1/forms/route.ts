@@ -1,50 +1,11 @@
 // app/api/admin/v1/forms/route.ts
 import { NextRequest } from "next/server";
-import { PrismaClient } from "@prisma/client";
+import prisma from "@/lib/prisma";
 import { jsonOk, jsonError } from "@/lib/api";
 import { requireTenantContext } from "@/lib/auth";
+import { isHttpError } from "@/lib/http";
 
 export const runtime = "nodejs";
-
-const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
-const prisma = globalForPrisma.prisma ?? new PrismaClient();
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
-
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === "string" && v.trim().length > 0;
-}
-
-async function resolveTenantAndUser(req: NextRequest, ctx: any): Promise<{
-  tenantId: string | null;
-  userId: string | null;
-}> {
-  const headerUserId = req.headers.get("x-user-id");
-  const headerTenantId = req.headers.get("x-tenant-id");
-
-  const userId: string | null =
-    (isNonEmptyString(ctx?.userId) && ctx.userId) ||
-    (isNonEmptyString(ctx?.user?.id) && ctx.user.id) ||
-    (isNonEmptyString(headerUserId) && headerUserId) ||
-    null;
-
-  let tenantId: string | null =
-    (isNonEmptyString(ctx?.tenantId) && ctx.tenantId) ||
-    (isNonEmptyString(ctx?.tenant?.id) && ctx.tenant.id) ||
-    (isNonEmptyString(ctx?.tenant) && ctx.tenant) ||
-    (isNonEmptyString(headerTenantId) && headerTenantId) ||
-    null;
-
-  // Fallback: tenantId via User lookup
-  if (!tenantId && userId) {
-    const u = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { tenantId: true },
-    });
-    tenantId = u?.tenantId ?? null;
-  }
-
-  return { tenantId, userId };
-}
 
 type FormListItem = {
   id: string;
@@ -55,14 +16,18 @@ type FormListItem = {
   updatedAt: string; // ISO
 };
 
-export async function GET(req: NextRequest) {
-  const ctx = await requireTenantContext(req);
-  if (ctx instanceof Response) return ctx;
-
-  const { tenantId } = await resolveTenantAndUser(req, ctx);
-  if (!tenantId) {
-    return jsonError(req, 403, "TENANT_REQUIRED", "Tenant context required");
+function handleError(req: Request, err: unknown, fallbackMessage: string) {
+  if (isHttpError(err)) {
+    return jsonError(req, err.status, err.code, err.message, err.details);
   }
+  return jsonError(req, 500, "INTERNAL_ERROR", fallbackMessage);
+}
+
+export async function GET(req: NextRequest) {
+  const auth = await requireTenantContext(req);
+  if (!auth.ok) return auth.res;
+
+  const tenantId = auth.ctx.tenantId;
 
   try {
     const forms = await prisma.form.findMany({
@@ -88,7 +53,7 @@ export async function GET(req: NextRequest) {
     }));
 
     return jsonOk(req, { items });
-  } catch {
-    return jsonError(req, 500, "INTERNAL_ERROR", "Failed to load forms");
+  } catch (err) {
+    return handleError(req, err, "Failed to load forms");
   }
 }

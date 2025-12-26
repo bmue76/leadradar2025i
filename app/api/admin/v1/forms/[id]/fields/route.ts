@@ -1,35 +1,32 @@
 // app/api/admin/v1/forms/[id]/fields/route.ts
 import { NextRequest } from "next/server";
-import { PrismaClient, Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import { z } from "zod";
+import prisma from "@/lib/prisma";
 import { jsonOk, jsonError } from "@/lib/api";
 import { requireTenantContext } from "@/lib/auth";
+import { isHttpError, validateBody } from "@/lib/http";
 
 export const runtime = "nodejs";
-
-const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
-const prisma = globalForPrisma.prisma ?? new PrismaClient();
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
-
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === "string" && v.trim().length > 0;
-}
 
 async function resolveParams(context: any): Promise<Record<string, any>> {
   const p = context?.params;
   const paramsObj =
     p && typeof p === "object" && typeof (p as any).then === "function" ? await p : p;
-  return (paramsObj && typeof paramsObj === "object") ? paramsObj : {};
+  return paramsObj && typeof paramsObj === "object" ? paramsObj : {};
 }
 
 async function resolveFormId(context: any): Promise<string | null> {
   const params = await resolveParams(context);
   const id = params?.id;
-  return isNonEmptyString(id) ? id.trim() : null;
+  if (typeof id !== "string") return null;
+  const t = id.trim();
+  return t.length > 0 ? t : null;
 }
 
 const KEY_REGEX = /^[A-Za-z0-9_-]+$/;
 
-const ALLOWED_FIELD_TYPES = new Set([
+const FieldTypeSchema = z.enum([
   "TEXT",
   "TEXTAREA",
   "EMAIL",
@@ -43,6 +40,45 @@ const ALLOWED_FIELD_TYPES = new Set([
   "URL",
 ]);
 
+const CreateFieldBodySchema = z
+  .object({
+    key: z
+      .preprocess((v: unknown) => (typeof v === "string" ? v.trim() : v), z.string().min(1))
+      .refine((s: string) => KEY_REGEX.test(s), { message: "key must match /^[A-Za-z0-9_-]+$/" }),
+    label: z.preprocess(
+      (v: unknown) => (typeof v === "string" ? v.trim() : v),
+      z.string().min(1)
+    ),
+    type: z.preprocess(
+      (v: unknown) => (typeof v === "string" ? v.trim().toUpperCase() : v),
+      FieldTypeSchema
+    ),
+    required: z.boolean().optional(),
+    isActive: z.boolean().optional(),
+    placeholder: z
+      .preprocess(
+        (v: unknown) => {
+          if (v === null) return null;
+          if (typeof v === "string") return v.trim();
+          return v;
+        },
+        z.union([z.string(), z.null()])
+      )
+      .optional(),
+    helpText: z
+      .preprocess(
+        (v: unknown) => {
+          if (v === null) return null;
+          if (typeof v === "string") return v.trim();
+          return v;
+        },
+        z.union([z.string(), z.null()])
+      )
+      .optional(),
+    config: z.unknown().optional(),
+  })
+  .strip();
+
 function serializeField(f: any) {
   return {
     ...f,
@@ -50,6 +86,13 @@ function serializeField(f: any) {
     createdAt: f.createdAt?.toISOString?.() ?? f.createdAt,
     updatedAt: f.updatedAt?.toISOString?.() ?? f.updatedAt,
   };
+}
+
+function handleError(req: Request, err: unknown, fallbackMessage: string) {
+  if (isHttpError(err)) {
+    return jsonError(req, err.status, err.code, err.message, err.details);
+  }
+  return jsonError(req, 500, "INTERNAL_ERROR", fallbackMessage);
 }
 
 export async function POST(req: NextRequest, context: any) {
@@ -63,98 +106,43 @@ export async function POST(req: NextRequest, context: any) {
     return jsonError(req, 400, "INVALID_REQUEST", "id (formId) is required");
   }
 
-  let body: any = null;
   try {
-    body = await req.json();
-  } catch {
-    return jsonError(req, 400, "INVALID_JSON", "Request body must be valid JSON");
-  }
+    const body = await validateBody(req, CreateFieldBodySchema);
 
-  const keyRaw = body?.key;
-  const labelRaw = body?.label;
-  const typeRaw = body?.type;
+    const form = await prisma.form.findFirst({
+      where: { id: formId, tenantId },
+      select: { id: true },
+    });
+    if (!form) {
+      return jsonError(req, 404, "NOT_FOUND", "Form not found");
+    }
 
-  if (!isNonEmptyString(keyRaw)) {
-    return jsonError(req, 400, "INVALID_REQUEST", "key must be a non-empty string");
-  }
-  if (!isNonEmptyString(labelRaw)) {
-    return jsonError(req, 400, "INVALID_REQUEST", "label must be a non-empty string");
-  }
-  if (!isNonEmptyString(typeRaw)) {
-    return jsonError(req, 400, "INVALID_REQUEST", "type must be a non-empty string");
-  }
+    const agg = await prisma.formField.aggregate({
+      where: { tenantId, formId },
+      _max: { sortOrder: true },
+    });
+    const nextSortOrder = (agg._max.sortOrder ?? -1) + 1;
 
-  const key = keyRaw.trim();
-  const label = labelRaw.trim();
-  const type = typeRaw.trim().toUpperCase();
+    const configValue =
+      body.config === undefined
+        ? undefined
+        : body.config === null
+          ? Prisma.JsonNull
+          : (body.config as Prisma.InputJsonValue);
 
-  if (!KEY_REGEX.test(key)) {
-    return jsonError(
-      req,
-      400,
-      "INVALID_REQUEST",
-      'key must match /^[A-Za-z0-9_-]+$/'
-    );
-  }
-
-  if (!ALLOWED_FIELD_TYPES.has(type)) {
-    return jsonError(
-      req,
-      400,
-      "INVALID_REQUEST",
-      `type must be one of: ${Array.from(ALLOWED_FIELD_TYPES).join(", ")}`
-    );
-  }
-
-  const requiredRaw = body?.required;
-  const isActiveRaw = body?.isActive;
-  const placeholderRaw = body?.placeholder;
-  const helpTextRaw = body?.helpText;
-  const configRaw = body?.config;
-
-  if (requiredRaw !== undefined && typeof requiredRaw !== "boolean") {
-    return jsonError(req, 400, "INVALID_REQUEST", "required must be boolean");
-  }
-  if (isActiveRaw !== undefined && typeof isActiveRaw !== "boolean") {
-    return jsonError(req, 400, "INVALID_REQUEST", "isActive must be boolean");
-  }
-  if (placeholderRaw !== undefined && placeholderRaw !== null && typeof placeholderRaw !== "string") {
-    return jsonError(req, 400, "INVALID_REQUEST", "placeholder must be string or null");
-  }
-  if (helpTextRaw !== undefined && helpTextRaw !== null && typeof helpTextRaw !== "string") {
-    return jsonError(req, 400, "INVALID_REQUEST", "helpText must be string or null");
-  }
-
-  // Ensure form exists (tenant-scoped)
-  const form = await prisma.form.findFirst({
-    where: { id: formId, tenantId },
-    select: { id: true },
-  });
-  if (!form) {
-    return jsonError(req, 404, "NOT_FOUND", "Form not found");
-  }
-
-  // sortOrder default = last + 1
-  const agg = await prisma.formField.aggregate({
-    where: { tenantId, formId },
-    _max: { sortOrder: true },
-  });
-  const nextSortOrder = (agg._max.sortOrder ?? -1) + 1;
-
-  try {
     const created = await prisma.formField.create({
       data: {
         tenantId,
         formId,
-        key,
-        label,
-        type: type as any,
-        required: requiredRaw ?? false,
-        isActive: isActiveRaw ?? true,
+        key: body.key,
+        label: body.label,
+        type: body.type as any,
+        required: body.required ?? false,
+        isActive: body.isActive ?? true,
         sortOrder: nextSortOrder,
-        placeholder: placeholderRaw === undefined ? undefined : (placeholderRaw === null ? null : String(placeholderRaw).trim()),
-        helpText: helpTextRaw === undefined ? undefined : (helpTextRaw === null ? null : String(helpTextRaw).trim()),
-        config: configRaw === undefined ? undefined : configRaw,
+        placeholder: body.placeholder === undefined ? undefined : body.placeholder,
+        helpText: body.helpText === undefined ? undefined : body.helpText,
+        config: configValue,
       },
       select: {
         id: true,
@@ -175,10 +163,7 @@ export async function POST(req: NextRequest, context: any) {
     });
 
     return jsonOk(req, { field: serializeField(created) }, { status: 201 });
-  } catch (e: any) {
-    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
-      return jsonError(req, 409, "KEY_CONFLICT", "Field key already exists for this form");
-    }
-    return jsonError(req, 500, "INTERNAL_ERROR", "Failed to create field");
+  } catch (err) {
+    return handleError(req, err, "Failed to create field");
   }
 }

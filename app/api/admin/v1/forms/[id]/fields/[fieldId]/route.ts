@@ -1,41 +1,40 @@
 // app/api/admin/v1/forms/[id]/fields/[fieldId]/route.ts
 import { NextRequest } from "next/server";
-import { PrismaClient, Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
+import { z } from "zod";
+import prisma from "@/lib/prisma";
 import { jsonOk, jsonError } from "@/lib/api";
 import { requireTenantContext } from "@/lib/auth";
+import { httpError, isHttpError, validateBody } from "@/lib/http";
 
 export const runtime = "nodejs";
-
-const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
-const prisma = globalForPrisma.prisma ?? new PrismaClient();
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
-
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === "string" && v.trim().length > 0;
-}
 
 async function resolveParams(context: any): Promise<Record<string, any>> {
   const p = context?.params;
   const paramsObj =
     p && typeof p === "object" && typeof (p as any).then === "function" ? await p : p;
-  return (paramsObj && typeof paramsObj === "object") ? paramsObj : {};
+  return paramsObj && typeof paramsObj === "object" ? paramsObj : {};
 }
 
 async function resolveFormId(context: any): Promise<string | null> {
   const params = await resolveParams(context);
   const id = params?.id;
-  return isNonEmptyString(id) ? id.trim() : null;
+  if (typeof id !== "string") return null;
+  const t = id.trim();
+  return t.length > 0 ? t : null;
 }
 
 async function resolveFieldId(context: any): Promise<string | null> {
   const params = await resolveParams(context);
   const fieldId = params?.fieldId;
-  return isNonEmptyString(fieldId) ? fieldId.trim() : null;
+  if (typeof fieldId !== "string") return null;
+  const t = fieldId.trim();
+  return t.length > 0 ? t : null;
 }
 
 const KEY_REGEX = /^[A-Za-z0-9_-]+$/;
 
-const ALLOWED_FIELD_TYPES = new Set([
+const FieldTypeSchema = z.enum([
   "TEXT",
   "TEXTAREA",
   "EMAIL",
@@ -49,6 +48,50 @@ const ALLOWED_FIELD_TYPES = new Set([
   "URL",
 ]);
 
+const PatchFieldBodySchema = z
+  .object({
+    label: z
+      .preprocess((v: unknown) => (typeof v === "string" ? v.trim() : v), z.string().min(1))
+      .optional(),
+    key: z
+      .preprocess((v: unknown) => (typeof v === "string" ? v.trim() : v), z.string().min(1))
+      .refine((s: string) => KEY_REGEX.test(s), { message: "key must match /^[A-Za-z0-9_-]+$/" })
+      .optional(),
+    type: z
+      .preprocess(
+        (v: unknown) => (typeof v === "string" ? v.trim().toUpperCase() : v),
+        FieldTypeSchema
+      )
+      .optional(),
+    required: z.boolean().optional(),
+    isActive: z.boolean().optional(),
+    placeholder: z
+      .preprocess(
+        (v: unknown) => {
+          if (v === null) return null;
+          if (typeof v === "string") return v.trim();
+          return v;
+        },
+        z.union([z.string(), z.null()])
+      )
+      .optional(),
+    helpText: z
+      .preprocess(
+        (v: unknown) => {
+          if (v === null) return null;
+          if (typeof v === "string") return v.trim();
+          return v;
+        },
+        z.union([z.string(), z.null()])
+      )
+      .optional(),
+    sortOrder: z
+      .preprocess((v: unknown) => (typeof v === "string" ? Number(v) : v), z.number().int().min(0))
+      .optional(),
+    config: z.unknown().optional(),
+  })
+  .strip();
+
 function serializeField(f: any) {
   return {
     ...f,
@@ -56,6 +99,13 @@ function serializeField(f: any) {
     createdAt: f.createdAt?.toISOString?.() ?? f.createdAt,
     updatedAt: f.updatedAt?.toISOString?.() ?? f.updatedAt,
   };
+}
+
+function handleError(req: Request, err: unknown, fallbackMessage: string) {
+  if (isHttpError(err)) {
+    return jsonError(req, err.status, err.code, err.message, err.details);
+  }
+  return jsonError(req, 500, "INTERNAL_ERROR", fallbackMessage);
 }
 
 export async function PATCH(req: NextRequest, context: any) {
@@ -74,129 +124,42 @@ export async function PATCH(req: NextRequest, context: any) {
     return jsonError(req, 400, "INVALID_REQUEST", "fieldId is required");
   }
 
-  let body: any = null;
   try {
-    body = await req.json();
-  } catch {
-    return jsonError(req, 400, "INVALID_JSON", "Request body must be valid JSON");
-  }
+    const body = await validateBody(req, PatchFieldBodySchema);
 
-  const data: any = {};
+    const data: any = {};
+    if (body.label !== undefined) data.label = body.label;
+    if (body.key !== undefined) data.key = body.key;
+    if (body.type !== undefined) data.type = body.type as any;
+    if (body.required !== undefined) data.required = body.required;
+    if (body.isActive !== undefined) data.isActive = body.isActive;
+    if (body.placeholder !== undefined) data.placeholder = body.placeholder;
+    if (body.helpText !== undefined) data.helpText = body.helpText;
+    if (body.sortOrder !== undefined) data.sortOrder = body.sortOrder;
+    if (body.config !== undefined) data.config = body.config;
 
-  // label
-  if (body?.label !== undefined) {
-    if (!isNonEmptyString(body.label)) {
-      return jsonError(req, 400, "INVALID_REQUEST", "label must be a non-empty string");
+    if (Object.keys(data).length === 0) {
+      throw httpError(400, "INVALID_BODY", "At least one field must be provided.");
     }
-    data.label = body.label.trim();
-  }
 
-  // key
-  if (body?.key !== undefined) {
-    if (!isNonEmptyString(body.key)) {
-      return jsonError(req, 400, "INVALID_REQUEST", "key must be a non-empty string");
-    }
-    const key = body.key.trim();
-    if (!KEY_REGEX.test(key)) {
-      return jsonError(req, 400, "INVALID_REQUEST", 'key must match /^[A-Za-z0-9_-]+$/');
-    }
-    data.key = key;
-  }
-
-  // type
-  if (body?.type !== undefined) {
-    if (!isNonEmptyString(body.type)) {
-      return jsonError(req, 400, "INVALID_REQUEST", "type must be a non-empty string");
-    }
-    const type = body.type.trim().toUpperCase();
-    if (!ALLOWED_FIELD_TYPES.has(type)) {
-      return jsonError(
-        req,
-        400,
-        "INVALID_REQUEST",
-        `type must be one of: ${Array.from(ALLOWED_FIELD_TYPES).join(", ")}`
-      );
-    }
-    data.type = type as any;
-  }
-
-  // required
-  if (body?.required !== undefined) {
-    if (typeof body.required !== "boolean") {
-      return jsonError(req, 400, "INVALID_REQUEST", "required must be boolean");
-    }
-    data.required = body.required;
-  }
-
-  // isActive
-  if (body?.isActive !== undefined) {
-    if (typeof body.isActive !== "boolean") {
-      return jsonError(req, 400, "INVALID_REQUEST", "isActive must be boolean");
-    }
-    data.isActive = body.isActive;
-  }
-
-  // placeholder
-  if (body?.placeholder !== undefined) {
-    if (body.placeholder === null) {
-      data.placeholder = null;
-    } else if (typeof body.placeholder === "string") {
-      data.placeholder = body.placeholder.trim();
-    } else {
-      return jsonError(req, 400, "INVALID_REQUEST", "placeholder must be string or null");
-    }
-  }
-
-  // helpText
-  if (body?.helpText !== undefined) {
-    if (body.helpText === null) {
-      data.helpText = null;
-    } else if (typeof body.helpText === "string") {
-      data.helpText = body.helpText.trim();
-    } else {
-      return jsonError(req, 400, "INVALID_REQUEST", "helpText must be string or null");
-    }
-  }
-
-  // sortOrder
-  if (body?.sortOrder !== undefined) {
-    const v = body.sortOrder;
-    if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
-      return jsonError(req, 400, "INVALID_REQUEST", "sortOrder must be an integer >= 0");
-    }
-    data.sortOrder = v;
-  }
-
-  // config
-  if (body?.config !== undefined) {
-    data.config = body.config;
-  }
-
-  if (Object.keys(data).length === 0) {
-    return jsonError(req, 400, "INVALID_REQUEST", "At least one field must be provided");
-  }
-
-  // Ensure field exists and is tenant/form scoped
-  const existing = await prisma.formField.findFirst({
-    where: { id: fieldId, tenantId, formId },
-    select: { id: true, key: true },
-  });
-  if (!existing) {
-    return jsonError(req, 404, "NOT_FOUND", "Field not found");
-  }
-
-  // key rename uniqueness
-  if (data.key && data.key !== existing.key) {
-    const conflict = await prisma.formField.findFirst({
-      where: { tenantId, formId, key: data.key, NOT: { id: fieldId } },
-      select: { id: true },
+    const existing = await prisma.formField.findFirst({
+      where: { id: fieldId, tenantId, formId },
+      select: { id: true, key: true },
     });
-    if (conflict) {
-      return jsonError(req, 409, "KEY_CONFLICT", "Field key already exists for this form");
+    if (!existing) {
+      return jsonError(req, 404, "NOT_FOUND", "Field not found");
     }
-  }
 
-  try {
+    if (data.key && data.key !== existing.key) {
+      const conflict = await prisma.formField.findFirst({
+        where: { tenantId, formId, key: data.key, NOT: { id: fieldId } },
+        select: { id: true },
+      });
+      if (conflict) {
+        return jsonError(req, 409, "KEY_CONFLICT", "Field key already exists for this form");
+      }
+    }
+
     const updated = await prisma.formField.update({
       where: { id: fieldId },
       data,
@@ -219,11 +182,11 @@ export async function PATCH(req: NextRequest, context: any) {
     });
 
     return jsonOk(req, { field: serializeField(updated) });
-  } catch (e: any) {
-    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+  } catch (err: any) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
       return jsonError(req, 409, "KEY_CONFLICT", "Field key already exists for this form");
     }
-    return jsonError(req, 500, "INTERNAL_ERROR", "Failed to update field");
+    return handleError(req, err, "Failed to update field");
   }
 }
 
@@ -243,18 +206,18 @@ export async function DELETE(req: NextRequest, context: any) {
     return jsonError(req, 400, "INVALID_REQUEST", "fieldId is required");
   }
 
-  const existing = await prisma.formField.findFirst({
-    where: { id: fieldId, tenantId, formId },
-    select: { id: true },
-  });
-  if (!existing) {
-    return jsonError(req, 404, "NOT_FOUND", "Field not found");
-  }
-
   try {
+    const existing = await prisma.formField.findFirst({
+      where: { id: fieldId, tenantId, formId },
+      select: { id: true },
+    });
+    if (!existing) {
+      return jsonError(req, 404, "NOT_FOUND", "Field not found");
+    }
+
     await prisma.formField.delete({ where: { id: fieldId } });
     return jsonOk(req, { deleted: true });
-  } catch {
-    return jsonError(req, 500, "INTERNAL_ERROR", "Failed to delete field");
+  } catch (err) {
+    return handleError(req, err, "Failed to delete field");
   }
 }

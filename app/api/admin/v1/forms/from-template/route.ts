@@ -1,48 +1,43 @@
 // app/api/admin/v1/forms/from-template/route.ts
 import { NextRequest } from "next/server";
-import { PrismaClient } from "@prisma/client";
+import { z } from "zod";
+import prisma from "@/lib/prisma";
 import { jsonOk, jsonError } from "@/lib/api";
 import { requireTenantContext } from "@/lib/auth";
+import { httpError, isHttpError, validateBody } from "@/lib/http";
 
 export const runtime = "nodejs";
 
-const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
-const prisma = globalForPrisma.prisma ?? new PrismaClient();
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+const KEY_REGEX = /^[A-Za-z0-9_-]+$/;
 
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === "string" && v.trim().length > 0;
-}
+const FieldTypeSchema = z.enum([
+  "TEXT",
+  "TEXTAREA",
+  "EMAIL",
+  "PHONE",
+  "NUMBER",
+  "SELECT",
+  "MULTISELECT",
+  "CHECKBOX",
+  "DATE",
+  "DATETIME",
+  "URL",
+]);
 
-async function resolveTenantAndUser(req: NextRequest, ctx: any): Promise<{
-  tenantId: string | null;
-  userId: string | null;
-}> {
-  const headerUserId = req.headers.get("x-user-id");
-
-  const userId: string | null =
-    (isNonEmptyString(ctx?.userId) && ctx.userId) ||
-    (isNonEmptyString(ctx?.user?.id) && ctx.user.id) ||
-    (isNonEmptyString(headerUserId) && headerUserId) ||
-    null;
-
-  let tenantId: string | null =
-    (isNonEmptyString(ctx?.tenantId) && ctx.tenantId) ||
-    (isNonEmptyString(ctx?.tenant?.id) && ctx.tenant.id) ||
-    (isNonEmptyString(ctx?.tenant) && ctx.tenant) ||
-    null;
-
-  // Fallback: Tenant via User (wichtig, weil requireTenantContext ctx.tenantId evtl. nicht setzt)
-  if (!tenantId && userId) {
-    const u = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { tenantId: true },
-    });
-    tenantId = u?.tenantId ?? null;
-  }
-
-  return { tenantId, userId };
-}
+const CreateFromTemplateBodySchema = z
+  .object({
+    templateId: z.preprocess(
+      (v: unknown) => (typeof v === "string" ? v.trim() : v),
+      z.string().min(1)
+    ),
+    name: z
+      .preprocess((v: unknown) => (typeof v === "string" ? v.trim() : v), z.string().min(1))
+      .optional(),
+    groupId: z
+      .preprocess((v: unknown) => (typeof v === "string" ? v.trim() : v), z.string().min(1))
+      .optional(),
+  })
+  .strip();
 
 type TemplateDefinition = {
   config?: { theme?: any; [k: string]: any };
@@ -57,90 +52,90 @@ type TemplateDefinition = {
   }>;
 };
 
+function handleError(req: Request, err: unknown, fallbackMessage: string) {
+  if (isHttpError(err)) {
+    return jsonError(req, err.status, err.code, err.message, err.details);
+  }
+  return jsonError(req, 500, "INTERNAL_ERROR", fallbackMessage);
+}
+
 export async function POST(req: NextRequest) {
-  const ctx = await requireTenantContext(req);
-  if (ctx instanceof Response) return ctx;
+  const auth = await requireTenantContext(req);
+  if (!auth.ok) return auth.res;
 
-  const { tenantId, userId } = await resolveTenantAndUser(req, ctx);
-  if (!tenantId) {
-    return jsonError(req, 403, "TENANT_REQUIRED", "Tenant context required");
-  }
-  if (!userId) {
-    return jsonError(req, 401, "UNAUTHORIZED", "Missing x-user-id");
-  }
+  const tenantId = auth.ctx.tenantId;
+  const userId = auth.ctx.user.id;
 
-  let body: any;
   try {
-    body = await req.json();
-  } catch {
-    return jsonError(req, 400, "INVALID_REQUEST", "Invalid JSON body");
-  }
+    const body = await validateBody(req, CreateFromTemplateBodySchema);
 
-  const templateId = body?.templateId;
-  const nameInput = body?.name;
-  const groupIdInput = body?.groupId;
+    const templateId = body.templateId;
+    const name = body.name ?? null;
+    const groupId = body.groupId ?? null;
 
-  if (!isNonEmptyString(templateId)) {
-    return jsonError(req, 400, "INVALID_REQUEST", "templateId is required");
-  }
-
-  const name: string | null = isNonEmptyString(nameInput) ? nameInput.trim() : null;
-  const groupId: string | null = isNonEmptyString(groupIdInput) ? groupIdInput.trim() : null;
-
-  // Group validation (leak-prevention)
-  if (groupId) {
-    const g = await prisma.group.findFirst({
-      where: { id: groupId, tenantId },
-      select: { id: true },
-    });
-    if (!g) {
-      return jsonError(req, 404, "NOT_FOUND", "Group not found");
+    if (groupId) {
+      const g = await prisma.group.findFirst({
+        where: { id: groupId, tenantId },
+        select: { id: true },
+      });
+      if (!g) {
+        return jsonError(req, 404, "NOT_FOUND", "Group not found");
+      }
     }
-  }
 
-  const tpl = await prisma.formTemplate.findFirst({
-    where: {
-      id: templateId.trim(),
-      OR: [{ kind: "SYSTEM", tenantId: null }, { kind: "TENANT", tenantId }],
-    },
-    select: {
-      id: true,
-      name: true,
-      definition: true,
-    },
-  });
+    const tpl = await prisma.formTemplate.findFirst({
+      where: {
+        id: templateId,
+        OR: [{ kind: "SYSTEM", tenantId: null }, { kind: "TENANT", tenantId }],
+      },
+      select: { id: true, name: true, definition: true },
+    });
 
-  if (!tpl) {
-    return jsonError(req, 404, "NOT_FOUND", "Template not found");
-  }
+    if (!tpl) {
+      return jsonError(req, 404, "NOT_FOUND", "Template not found");
+    }
 
-  const def = (tpl.definition ?? {}) as TemplateDefinition;
-  const theme = def?.config?.theme ?? def?.theme ?? null;
-  const config = theme ? { theme } : {};
+    const def = (tpl.definition ?? {}) as TemplateDefinition;
+    const theme = def?.config?.theme ?? def?.theme ?? null;
+    const config = theme ? { theme } : {};
 
-  const fields = Array.isArray(def?.fields) ? def.fields : [];
-  const normalizedFields = fields.map((f, idx) => ({
-    key: String(f.key ?? "").trim(),
-    label: String(f.label ?? "").trim(),
-    type: String(f.type ?? "").trim(),
-    required: Boolean(f.required),
-    config: f.config ?? {},
-    sortOrder:
-      typeof f.sortOrder === "number" && Number.isFinite(f.sortOrder) ? f.sortOrder : idx + 1,
-  }));
+    const fields = Array.isArray(def?.fields) ? def.fields : [];
 
-  if (normalizedFields.some((f) => !f.key || !f.label || !f.type)) {
-    return jsonError(req, 400, "INVALID_TEMPLATE", "Template has invalid fields");
-  }
+    const normalizedFields = fields.map((f, idx) => {
+      const key = String(f.key ?? "").trim();
+      const label = String(f.label ?? "").trim();
+      const type = String(f.type ?? "").trim().toUpperCase();
 
-  try {
+      return {
+        key,
+        label,
+        type,
+        required: Boolean(f.required),
+        config: f.config ?? {},
+        sortOrder: idx + 1,
+      };
+    });
+
+    for (const f of normalizedFields) {
+      if (!f.key || !f.label || !f.type) {
+        throw httpError(400, "INVALID_TEMPLATE", "Template has invalid fields.");
+      }
+      if (!KEY_REGEX.test(f.key)) {
+        throw httpError(400, "INVALID_TEMPLATE", "Template field key is invalid.", { key: f.key });
+      }
+      const typeCheck = FieldTypeSchema.safeParse(f.type);
+      if (!typeCheck.success) {
+        throw httpError(400, "INVALID_TEMPLATE", "Template field type is invalid.", { type: f.type });
+      }
+    }
+
     const created = await prisma.$transaction(async (tx) => {
       const form = await tx.form.create({
         data: {
           tenantId,
           templateId: tpl.id,
           name: name ?? tpl.name,
-          status: "DRAFT", // ASSUMPTION gemäss Spec
+          status: "DRAFT",
           groupId,
           createdByUserId: userId,
           config,
@@ -157,16 +152,15 @@ export async function POST(req: NextRequest) {
             label: f.label,
             type: f.type as any,
             required: f.required,
+            isActive: true,
             config: f.config,
             sortOrder: f.sortOrder,
           })),
         });
       }
 
-      // AuditEvent (best effort)
       try {
-        // @ts-ignore
-        await tx.auditEvent.create({
+        await (tx as any).auditEvent?.create?.({
           data: {
             tenantId,
             actorType: "USER",
@@ -177,15 +171,13 @@ export async function POST(req: NextRequest) {
             meta: { templateId: tpl.id },
           },
         });
-      } catch {
-        // ignore if model differs
-      }
+      } catch {}
 
       return form;
     });
 
     return jsonOk(req, { id: created.id });
-  } catch {
-    return jsonError(req, 500, "INTERNAL_ERROR", "Failed to create form from template");
+  } catch (err) {
+    return handleError(req, err, "Failed to create form from template");
   }
 }
