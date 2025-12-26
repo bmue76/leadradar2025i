@@ -5,30 +5,32 @@ import { adminFetch } from '../_lib/adminFetch';
 
 type WhoAmIData = any;
 
+type WhoAmIState =
+  | { status: 'idle' | 'loading'; data: WhoAmIData | null; message?: string; raw?: unknown }
+  | { status: 'ok'; data: WhoAmIData; raw?: unknown }
+  | { status: 'error'; data: WhoAmIData | null; message: string; raw?: unknown };
+
 export function WhoAmIClient() {
-  const [state, setState] = React.useState<
-    | { status: 'idle' | 'loading' }
-    | { status: 'ok'; data: WhoAmIData }
-    | { status: 'error'; message: string; raw?: unknown }
-  >({ status: 'idle' });
+  const [state, setState] = React.useState<WhoAmIState>({ status: 'idle', data: null });
 
   async function load() {
-    setState({ status: 'loading' });
+    setState((prev) => ({ status: 'loading', data: prev.data ?? null }));
 
     const res = await adminFetch<WhoAmIData>('/api/admin/v1/whoami', {
       method: 'GET',
     });
 
     if (res.ok) {
-      setState({ status: 'ok', data: res.data });
+      setState({ status: 'ok', data: res.data, raw: res.raw });
       return;
     }
 
-    setState({
+    setState((prev) => ({
       status: 'error',
+      data: prev.data ?? null,
       message: res.error?.message ?? 'Unbekannter Fehler',
       raw: res.raw,
-    });
+    }));
   }
 
   React.useEffect(() => {
@@ -64,8 +66,9 @@ export function WhoAmIClient() {
             <div className="mt-1">{state.message}</div>
 
             <div className="mt-3 text-xs text-red-900/80">
-              DEV-Tipp: Setze oben im Header eine gültige <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code>{' '}
-              (Owner/Member cuid). Danach Refresh.
+              DEV-Tipp: Setze oben im Header eine gültige{' '}
+              <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code> (Owner/Member cuid).
+              Danach Refresh.
             </div>
 
             {state.raw ? (
@@ -87,7 +90,8 @@ export function WhoAmIClient() {
             </div>
 
             <p className="text-xs text-slate-500">
-              Hinweis: In 2.0 zeigen wir Status/Struktur minimal. In 2.1 kommen Interaktionen (z.B. Status-Toggle).
+              Hinweis: In 2.0 zeigen wir Status/Struktur minimal. In 2.1 kommen Interaktionen
+              (z.B. Status-Toggle).
             </p>
           </div>
         )}

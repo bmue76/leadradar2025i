@@ -6,6 +6,11 @@ import { adminFetch } from '../../_lib/adminFetch';
 
 type Form = any;
 
+type FormsState =
+  | { status: 'loading' | 'idle'; items: Form[]; paging?: any; raw?: unknown; message?: string }
+  | { status: 'ok'; items: Form[]; paging?: any; raw: unknown }
+  | { status: 'error'; items: Form[]; paging?: any; raw?: unknown; message: string };
+
 function normalizeItems(rawData: any): { items: Form[]; paging?: any } {
   const d = rawData;
   if (Array.isArray(d)) return { items: d };
@@ -60,17 +65,18 @@ function nextPrimaryAction(status: string): { label: string; toStatus: 'DRAFT' |
 }
 
 export function FormsListClient() {
-  const [state, setState] = React.useState<
-    | { status: 'loading' | 'idle' }
-    | { status: 'ok'; items: Form[]; paging?: any; raw: unknown }
-    | { status: 'error'; message: string; raw?: unknown }
-  >({ status: 'idle' });
+  const [state, setState] = React.useState<FormsState>({ status: 'idle', items: [] });
 
   const [busyById, setBusyById] = React.useState<Record<string, boolean>>({});
   const [actionErrorById, setActionErrorById] = React.useState<Record<string, string>>({});
 
   async function load() {
-    setState({ status: 'loading' });
+    setState((prev) => ({
+      status: 'loading',
+      items: prev.items,
+      paging: prev.paging,
+      raw: prev.raw,
+    }));
 
     const res = await adminFetch<any>('/api/admin/v1/forms', { method: 'GET' });
 
@@ -80,11 +86,13 @@ export function FormsListClient() {
       return;
     }
 
-    setState({
+    setState((prev) => ({
       status: 'error',
       message: res.error?.message ?? 'Unbekannter Fehler',
       raw: res.raw,
-    });
+      items: prev.items,
+      paging: prev.paging,
+    }));
   }
 
   async function patchStatus(formId: string, toStatus: 'DRAFT' | 'ACTIVE' | 'ARCHIVED') {
@@ -106,7 +114,6 @@ export function FormsListClient() {
       return;
     }
 
-    // Refresh list (no-store fetch vorhanden)
     await load();
     setBusyById((m) => ({ ...m, [formId]: false }));
   }
@@ -162,7 +169,9 @@ export function FormsListClient() {
             <div className="flex items-center justify-between">
               <div className="text-sm text-slate-700">
                 Gefunden: <span className="font-medium">{state.items.length}</span>
-                {state.paging ? <span className="ml-2 text-xs text-slate-500">(Paging vorhanden)</span> : null}
+                {state.paging ? (
+                  <span className="ml-2 text-xs text-slate-500">(Paging vorhanden)</span>
+                ) : null}
               </div>
 
               <div className="text-xs text-slate-500">Status toggle via PATCH (2.1)</div>
@@ -260,7 +269,9 @@ export function FormsListClient() {
             </div>
 
             <details className="rounded-lg border bg-slate-50 p-3">
-              <summary className="cursor-pointer text-sm font-medium text-slate-800">Debug: Raw JSON</summary>
+              <summary className="cursor-pointer text-sm font-medium text-slate-800">
+                Debug: Raw JSON
+              </summary>
               <pre className="mt-3 overflow-auto text-xs text-slate-900">
                 {JSON.stringify(state.raw, null, 2)}
               </pre>

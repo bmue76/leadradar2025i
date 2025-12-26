@@ -5,15 +5,13 @@ import { adminFetch } from '../../_lib/adminFetch';
 
 type Template = any;
 
+type TemplatesState =
+  | { status: 'loading' | 'idle'; items: Template[]; raw?: unknown; message?: string }
+  | { status: 'ok'; items: Template[]; raw: unknown }
+  | { status: 'error'; items: Template[]; raw?: unknown; message: string };
+
 function pickLabel(t: Template): string {
-  return (
-    t?.name ??
-    t?.title ??
-    t?.label ??
-    t?.displayName ??
-    t?.slug ??
-    'Template'
-  );
+  return t?.name ?? t?.title ?? t?.label ?? t?.displayName ?? t?.slug ?? 'Template';
 }
 
 function pickCategory(t: Template): string {
@@ -21,20 +19,10 @@ function pickCategory(t: Template): string {
 }
 
 function pickUpdated(t: Template): string {
-  return (
-    t?.updatedAt ??
-    t?.createdAt ??
-    t?.meta?.updatedAt ??
-    t?.meta?.createdAt ??
-    ''
-  );
+  return t?.updatedAt ?? t?.createdAt ?? t?.meta?.updatedAt ?? t?.meta?.createdAt ?? '';
 }
 
 function normalizeItems(rawData: any): Template[] {
-  // Accept common shapes:
-  // - { items: [...] }
-  // - { data: { items: [...] } } (adminFetch already unwraps .data, but still handle)
-  // - [ ... ]
   const d = rawData;
   if (Array.isArray(d)) return d;
   if (Array.isArray(d?.items)) return d.items;
@@ -44,14 +32,10 @@ function normalizeItems(rawData: any): Template[] {
 }
 
 export function TemplatesListClient() {
-  const [state, setState] = React.useState<
-    | { status: 'loading' | 'idle' }
-    | { status: 'ok'; items: Template[]; raw: unknown }
-    | { status: 'error'; message: string; raw?: unknown }
-  >({ status: 'idle' });
+  const [state, setState] = React.useState<TemplatesState>({ status: 'idle', items: [] });
 
   async function load() {
-    setState({ status: 'loading' });
+    setState((prev) => ({ status: 'loading', items: prev.items, raw: prev.raw }));
 
     const res = await adminFetch<any>('/api/admin/v1/templates', { method: 'GET' });
 
@@ -61,11 +45,12 @@ export function TemplatesListClient() {
       return;
     }
 
-    setState({
+    setState((prev) => ({
       status: 'error',
       message: res.error?.message ?? 'Unbekannter Fehler',
       raw: res.raw,
-    });
+      items: prev.items,
+    }));
   }
 
   React.useEffect(() => {
@@ -101,8 +86,8 @@ export function TemplatesListClient() {
             <div className="mt-1">{state.message}</div>
 
             <div className="mt-3 text-xs text-red-900/80">
-              DEV-Tipp: Setze oben im Header eine gültige <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code>{' '}
-              und lade neu.
+              DEV-Tipp: Setze oben im Header eine gültige{' '}
+              <code className="rounded bg-red-100 px-1 py-0.5">x-user-id</code> und lade neu.
             </div>
 
             {state.raw ? (
@@ -142,10 +127,11 @@ export function TemplatesListClient() {
                       <td className="px-3 py-2 font-mono text-xs text-slate-700">{t?.id ?? '—'}</td>
                     </tr>
                   ))}
+
                   {state.items.length === 0 ? (
                     <tr className="border-t">
                       <td className="px-3 py-3 text-slate-600" colSpan={4}>
-                        Keine Templates gefunden. (Wenn du Seed erwartest: checke DB/Seed & Admin API.)
+                        Keine Templates gefunden. (Wenn du Seed erwartest: checke DB/Seed &amp; Admin API.)
                       </td>
                     </tr>
                   ) : null}
