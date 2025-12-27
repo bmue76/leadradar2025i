@@ -1,4 +1,4 @@
-// app/api/admin/v1/exports/[id]/download/route.ts
+// app/api/admin/v1/leads/[id]/attachments/[attachmentId]/download/route.ts
 import crypto from "node:crypto";
 import fsp from "node:fs/promises";
 import { Readable } from "node:stream";
@@ -10,10 +10,9 @@ import { requireTenantContext } from "@/lib/auth";
 import prisma from "@/lib/prisma";
 
 import {
-  EXPORTS_ROOT_ABS,
-  resolveUnderRoot,
+  UPLOADS_ROOT_ABS,
   isSafeRelativeKey,
-  coerceLegacyPathToRelativeKey,
+  resolveUnderRoot,
   sanitizeFilename,
   createReadStreamSafe,
 } from "@/lib/storage";
@@ -22,13 +21,13 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 function contentDispositionAttachment(filename: string) {
-  const safe = sanitizeFilename(filename || "export.csv");
+  const safe = sanitizeFilename(filename || "attachment");
   return `attachment; filename="${safe}"`;
 }
 
 export async function GET(
   req: NextRequest,
-  ctx: { params: Promise<{ id: string }> }
+  ctx: { params: Promise<{ id: string; attachmentId: string }> }
 ) {
   const traceId = req.headers.get("x-trace-id") ?? crypto.randomUUID();
 
@@ -36,45 +35,43 @@ export async function GET(
     const t = await requireTenantContext(req);
     if (!t.ok) return t.res;
 
-    const { id } = await ctx.params;
+    const { id: leadId, attachmentId } = await ctx.params;
     const tenantId = t.ctx.tenantId;
 
-    const job = await (prisma as any).exportJob.findFirst({
-      where: { id, tenantId },
+    const lead = await prisma.lead.findFirst({
+      where: { id: leadId, tenantId } as any,
+      select: { id: true },
+    });
+    if (!lead) return jsonError(req, 404, "NOT_FOUND", "Not found");
+
+    const attachment = await prisma.leadAttachment.findFirst({
+      where: { id: attachmentId, tenantId, leadId } as any,
       select: {
         id: true,
         storageKey: true,
         filename: true,
         mimeType: true,
-      },
+      } as any,
     });
 
-    if (!job) {
-      return jsonError(req, 404, "NOT_FOUND", "Export not found");
-    }
+    if (!attachment) return jsonError(req, 404, "NOT_FOUND", "Not found");
 
-    let storageKey: string | null = job.storageKey ?? null;
-    if (storageKey && !isSafeRelativeKey(storageKey)) {
-      storageKey = coerceLegacyPathToRelativeKey(storageKey);
-    }
-
-    if (!storageKey) {
-      return jsonError(req, 404, "NO_FILE", "No export file available");
-    }
+    const storageKey: string | null = (attachment as any).storageKey ?? null;
+    if (!storageKey) return jsonError(req, 404, "NO_FILE", "No file");
 
     if (!isSafeRelativeKey(storageKey)) {
       return jsonError(req, 400, "INVALID_STORAGE_KEY", "Invalid storage key");
     }
 
-    const absPath = resolveUnderRoot(EXPORTS_ROOT_ABS, storageKey);
+    const absPath = resolveUnderRoot(UPLOADS_ROOT_ABS, storageKey);
 
     const stat = await fsp.stat(absPath).catch(() => null);
     if (!stat || !stat.isFile()) {
-      return jsonError(req, 404, "NO_FILE", "No export file available");
+      return jsonError(req, 404, "NO_FILE", "No file");
     }
 
-    const filename = job.filename ?? "export.csv";
-    const mimeType = job.mimeType ?? "text/csv; charset=utf-8";
+    const filename = (attachment as any).filename ?? "attachment";
+    const mimeType = (attachment as any).mimeType ?? "application/octet-stream";
 
     const nodeStream = createReadStreamSafe(absPath);
     const webStream = Readable.toWeb(nodeStream as any) as any;
