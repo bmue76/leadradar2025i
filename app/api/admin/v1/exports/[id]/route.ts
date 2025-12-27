@@ -1,70 +1,53 @@
-// app/api/admin/v1/exports/[id]/route.ts
+import { NextRequest } from "next/server";
+
+import { jsonOk, jsonError } from "@/lib/api";
+import { HttpError, isHttpError } from "@/lib/http";
 import prisma from "@/lib/prisma";
 import { requireTenantContext } from "@/lib/auth";
-import { jsonError, jsonOk } from "@/lib/api";
-import { httpError, isHttpError } from "@/lib/http";
 
 export const runtime = "nodejs";
 
-type ExportStatus = "QUEUED" | "RUNNING" | "DONE" | "FAILED";
+function tenantIdFromTenantResult(tr: any): string {
+  return String(tr?.tenantId ?? tr?.ctx?.tenantId ?? "");
+}
 
-type ExportDetail = {
-  id: string;
-  status: ExportStatus;
-  createdAt: string;
-  updatedAt: string;
-  formId: string | null;
-  groupId: string | null;
-
-  canDownload: boolean;
-  downloadUrl: string | null;
-
-  errorMessage: string | null;
-};
-
-export async function GET(req: Request, routeCtx: { params: { id: string } }) {
+export async function GET(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
   try {
+    const { id } = await params;
+    if (!id) throw new HttpError(400, "BAD_REQUEST", "Missing export id");
+
     const tr: any = await requireTenantContext(req);
-    const ctx = tr?.ctx ?? tr;
-    const tenantId: string | undefined = ctx?.tenantId;
+    const tenantId = tenantIdFromTenantResult(tr);
+    if (!tenantId) throw new HttpError(401, "UNAUTHORIZED", "Missing tenant context");
 
-    if (!tenantId) {
-      return jsonError(req, 401, "Unauthorized", "UNAUTHORIZED");
-    }
-
-    const id = routeCtx?.params?.id;
-    if (!id || typeof id !== "string") {
-      throw httpError(400, "Missing export id", "BAD_REQUEST");
-    }
-
-    // Tenant-scoped lookup (no ownerId in your ExportJob schema)
     const job: any = await prisma.exportJob.findFirst({
       where: { id, tenantId },
     });
 
-    if (!job) {
-      throw httpError(404, "Export not found", "NOT_FOUND");
-    }
+    if (!job) throw new HttpError(404, "NOT_FOUND", "Export job not found");
 
-    const canDownload = job.status === "DONE" && Boolean(job.resultStorageKey);
+    const downloadUrl =
+      job.status === "DONE"
+        ? `/api/admin/v1/exports/${job.id}/download`
+        : undefined;
 
-    const data: ExportDetail = {
+    // keep response stable-ish: return core fields + downloadUrl only if DONE
+    return jsonOk(req, {
       id: job.id,
       status: job.status,
-      createdAt: new Date(job.createdAt).toISOString(),
-      updatedAt: new Date(job.updatedAt).toISOString(),
-      formId: job.formId ?? null,
-      groupId: job.groupId ?? null,
-      canDownload,
-      downloadUrl: canDownload ? `/api/admin/v1/exports/${job.id}/download` : null,
-      errorMessage: job.errorMessage ?? null,
-    };
-
-    return jsonOk(req, data);
-  } catch (err: any) {
-    if (isHttpError(err)) {
-      return jsonError(req, err.status, err.message, err.code, err.details);
-    }
-    return jsonError(req, 500, "Internal Server Error", "INTERNAL");
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      // keep for audit / debugging (file may be missing after retention)
+      resultStorageKey: job.resultStorageKey ?? null,
+      downloadUrl,
+      // optional: if your model has a JSON "file" config, expose it (safe)
+      file: job.file ?? undefined,
+    });
+  } catch (e: any) {
+    if (isHttpError(e)) return jsonError(req, e.status, e.code, e.message);
+    return jsonError(req, 500, "INTERNAL", "Internal server error");
   }
 }
