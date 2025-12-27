@@ -1,101 +1,77 @@
-// app/api/admin/v1/exports/[id]/download/route.ts
-import crypto from "node:crypto";
-import fsp from "node:fs/promises";
-import { Readable } from "node:stream";
+import * as fsp from "node:fs/promises";
 import { NextRequest } from "next/server";
 
-import { jsonError } from "@/lib/api";
-import { HttpError } from "@/lib/http";
-import { requireTenantContext } from "@/lib/auth";
+import { getTraceId, jsonError } from "@/lib/api";
+import { HttpError, isHttpError } from "@/lib/http";
 import prisma from "@/lib/prisma";
+import { requireTenantContext } from "@/lib/auth";
 
-import {
-  EXPORTS_ROOT_ABS,
-  resolveUnderRoot,
-  isSafeRelativeKey,
-  coerceLegacyPathToRelativeKey,
-  sanitizeFilename,
-  createReadStreamSafe,
-} from "@/lib/storage";
+import { resolveExportFileAbsPath } from "@/lib/exports/cleanup";
 
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
-function contentDispositionAttachment(filename: string) {
-  const safe = sanitizeFilename(filename || "export.csv");
-  return `attachment; filename="${safe}"`;
+function tenantIdFromTenantResult(tr: any): string {
+  return String(tr?.tenantId ?? tr?.ctx?.tenantId ?? "");
 }
 
 export async function GET(
   req: NextRequest,
-  ctx: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> }
 ) {
-  const traceId = req.headers.get("x-trace-id") ?? crypto.randomUUID();
+  const traceId = getTraceId(req);
 
   try {
-    const t = await requireTenantContext(req);
-    if (!t.ok) return t.res;
+    const { id } = await params;
+    if (!id) throw new HttpError(400, "BAD_REQUEST", "Missing export id");
 
-    const { id } = await ctx.params;
-    const tenantId = t.ctx.tenantId;
+    const tr: any = await requireTenantContext(req);
+    const tenantId = tenantIdFromTenantResult(tr);
+    if (!tenantId) throw new HttpError(401, "UNAUTHORIZED", "Missing tenant context");
 
-    const job = await (prisma as any).exportJob.findFirst({
+    const job = await prisma.exportJob.findFirst({
       where: { id, tenantId },
-      select: {
-        id: true,
-        storageKey: true,
-        filename: true,
-        mimeType: true,
-      },
+      select: { id: true, status: true, resultStorageKey: true },
     });
 
-    if (!job) {
-      return jsonError(req, 404, "NOT_FOUND", "Export not found");
+    if (!job) throw new HttpError(404, "NOT_FOUND", "Export job not found");
+
+    if (job.status !== "DONE") {
+      throw new HttpError(409, "NOT_READY", "Export is not ready for download");
     }
 
-    let storageKey: string | null = job.storageKey ?? null;
-    if (storageKey && !isSafeRelativeKey(storageKey)) {
-      storageKey = coerceLegacyPathToRelativeKey(storageKey);
+    const key = job.resultStorageKey ? String(job.resultStorageKey) : "";
+    if (!key) {
+      return jsonError(req, 404, "NO_FILE", "File not found (cleaned up)");
     }
 
-    if (!storageKey) {
-      return jsonError(req, 404, "NO_FILE", "No export file available");
+    const resolved = resolveExportFileAbsPath(key);
+    if (!resolved) {
+      // Root-Guard block => treat as missing (no leak)
+      return jsonError(req, 404, "NO_FILE", "File not found (cleaned up)");
     }
 
-    if (!isSafeRelativeKey(storageKey)) {
-      return jsonError(req, 400, "INVALID_STORAGE_KEY", "Invalid storage key");
+    // exists?
+    try {
+      const st = await fsp.stat(resolved.absPath);
+      if (!st.isFile()) return jsonError(req, 404, "NO_FILE", "File not found (cleaned up)");
+    } catch (e: any) {
+      if (e?.code === "ENOENT") return jsonError(req, 404, "NO_FILE", "File not found (cleaned up)");
+      throw e;
     }
 
-    const absPath = resolveUnderRoot(EXPORTS_ROOT_ABS, storageKey);
+    const csvBuf = await fsp.readFile(resolved.absPath);
+    const body = new Uint8Array(csvBuf);
 
-    const stat = await fsp.stat(absPath).catch(() => null);
-    if (!stat || !stat.isFile()) {
-      return jsonError(req, 404, "NO_FILE", "No export file available");
-    }
+    const filename = `leadradar-export-${job.id}.csv`;
+    const headers = new Headers();
+    headers.set("content-type", "text/csv; charset=utf-8");
+    headers.set("content-disposition", `attachment; filename="${filename}"`);
+    headers.set("cache-control", "no-store");
+    headers.set("x-trace-id", traceId);
 
-    const filename = job.filename ?? "export.csv";
-    const mimeType = job.mimeType ?? "text/csv; charset=utf-8";
-
-    const nodeStream = createReadStreamSafe(absPath);
-    const webStream = Readable.toWeb(nodeStream as any) as any;
-
-    return new Response(webStream, {
-      status: 200,
-      headers: {
-        "content-type": mimeType,
-        "content-length": String(stat.size),
-        "content-disposition": contentDispositionAttachment(filename),
-        "cache-control": "no-store",
-        "x-trace-id": traceId,
-      },
-    });
-  } catch (err: any) {
-    if (err instanceof HttpError) {
-      return jsonError(req, err.status, err.code, err.message);
-    }
-    if (err?.code === "INVALID_STORAGE_KEY") {
-      return jsonError(req, 400, "INVALID_STORAGE_KEY", "Invalid storage key");
-    }
-    return jsonError(req, 500, "INTERNAL_ERROR", "Unexpected error");
+    return new Response(body, { status: 200, headers });
+  } catch (e: any) {
+    if (isHttpError(e)) return jsonError(req, e.status, e.code, e.message);
+    return jsonError(req, 500, "INTERNAL", "Internal server error");
   }
 }
