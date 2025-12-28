@@ -101,7 +101,7 @@ export default function OutboxScreen() {
   const isOnline = useMemo(() => {
     // treat "null" internetReachable as "unknown" -> fall back to isConnected
     const connected = netInfo.isConnected === true;
-    const reachable = netInfo.isInternetReachable;
+    const reachable = netInfo.isInternetReachable !== false;
     if (reachable === false) return false;
     return connected;
   }, [netInfo.isConnected, netInfo.isInternetReachable]);

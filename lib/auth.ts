@@ -1,3 +1,4 @@
+// lib/auth.ts
 import type { Tenant, User } from "@prisma/client";
 import type { NextResponse } from "next/server";
 import prisma from "./prisma";
@@ -14,12 +15,22 @@ export type TenantContext = {
   tenantId: string;
 };
 
+export type MobileTenantContext = {
+  tenant: Tenant;
+  tenantId: string;
+  tenantSlug: string;
+};
+
 type AuthResult =
   | { ok: true; ctx: AuthContext }
   | { ok: false; res: NextResponse<ApiErrorBody> };
 
 type TenantResult =
   | { ok: true; ctx: TenantContext }
+  | { ok: false; res: NextResponse<ApiErrorBody> };
+
+type MobileTenantResult =
+  | { ok: true; ctx: MobileTenantContext }
   | { ok: false; res: NextResponse<ApiErrorBody> };
 
 function headerTrim(req: Request, key: string): string | null {
@@ -62,12 +73,7 @@ export async function requireTenantContext(req: Request): Promise<TenantResult> 
   if (user.role !== "TENANT_OWNER") {
     return {
       ok: false,
-      res: jsonError(
-        req,
-        403,
-        "FORBIDDEN",
-        "Owner role required for admin access."
-      ),
+      res: jsonError(req, 403, "FORBIDDEN", "Owner role required for admin access."),
     };
   }
 
@@ -88,4 +94,33 @@ export async function requireTenantContext(req: Request): Promise<TenantResult> 
   }
 
   return { ok: true, ctx: { user, tenant, tenantId: user.tenantId } };
+}
+
+/**
+ * Mobile tenant auth (MVP):
+ * - expects header "x-tenant-slug"
+ * - resolves tenant by slug
+ *
+ * NOTE: For production you add device/api-key verification.
+ */
+export async function requireMobileTenantContext(req: Request): Promise<MobileTenantResult> {
+  const tenantSlug = headerTrim(req, "x-tenant-slug");
+  if (!tenantSlug) {
+    return {
+      ok: false,
+      res: jsonError(req, 401, "UNAUTHENTICATED", 'Missing header "x-tenant-slug".'),
+    };
+  }
+
+  // assumes Tenant.slug exists + is unique
+  const tenant = await prisma.tenant.findFirst({ where: { slug: tenantSlug } });
+
+  if (!tenant) {
+    return {
+      ok: false,
+      res: jsonError(req, 401, "UNAUTHENTICATED", "Unknown tenant slug."),
+    };
+  }
+
+  return { ok: true, ctx: { tenant, tenantId: tenant.id, tenantSlug } };
 }

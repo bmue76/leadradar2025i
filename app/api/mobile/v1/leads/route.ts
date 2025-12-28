@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import { jsonOk, jsonError } from "@/lib/api";
 import { validateBody, HttpError } from "@/lib/http";
-import { requireTenantContext } from "@/lib/auth";
+import { requireMobileTenantContext } from "@/lib/auth";
 import prisma from "@/lib/prisma";
 
 import {
@@ -23,13 +23,17 @@ const BodySchema = z
   .object({
     formId: z.string().min(1),
 
+    clientLeadId: z.string().min(1).optional(),
+    capturedByDeviceUid: z.string().optional(),
+    meta: z.any().optional(),
+
     // flexible payload
     data: z.any().optional(),
     values: z.any().optional(),
     fields: z.any().optional(),
     payload: z.any().optional(),
 
-    // base64 card (legacy + nested)
+    // legacy card naming
     cardBase64: z.string().optional(),
     cardFilename: z.string().optional(),
     cardMimeType: z.string().optional(),
@@ -40,6 +44,11 @@ const BodySchema = z
         mimeType: z.string().optional(),
       })
       .optional(),
+
+    // mobile naming
+    cardImageBase64: z.string().optional(),
+    cardImageFilename: z.string().optional(),
+    cardImageMimeType: z.string().optional(),
   })
   .passthrough();
 
@@ -65,57 +74,95 @@ function inferExt(mimeType?: string) {
 
 export async function POST(req: NextRequest) {
   try {
-    const t = await requireTenantContext(req);
+    const t = await requireMobileTenantContext(req);
     if (!t.ok) return t.res;
 
     const tenantId = t.ctx.tenantId;
 
     const body = await validateBody(req, BodySchema);
 
-    const lead = await prisma.lead.create({
-      data: {
-        tenantId,
-        formId: body.formId,
-        data: (body.data ?? body.values ?? body.fields ?? body.payload ?? body) as any,
-      } as any,
+    // scope guard: form must belong to tenant
+    const form = await prisma.form.findFirst({
+      where: { id: body.formId, tenantId },
       select: { id: true },
     });
+    if (!form) {
+      return jsonError(req, 404, "NOT_FOUND", "Form not found for tenant.");
+    }
 
-    const cardBase64 = body.cardBase64 ?? body.card?.base64;
-    const cardMimeType = body.cardMimeType ?? body.card?.mimeType ?? "image/jpeg";
-    const originalName = body.cardFilename ?? body.card?.filename;
+    const dataJson = (body.data ?? body.values ?? body.fields ?? body.payload ?? body) as any;
 
-    if (cardBase64) {
-      const bytes = decodeBase64(cardBase64);
-      if (bytes.byteLength > 0) {
-        const ext = inferExt(cardMimeType);
-        const safeName = sanitizeFilename(originalName ?? `card.${ext}`);
-        const filename = safeName.includes(".") ? safeName : `${safeName}.${ext}`;
+    let leadId: string;
 
-        const unique = `${Date.now()}-${crypto.randomUUID()}`;
-        const storageKey = buildUploadsKey({
+    // robust create: try extended schema, fallback to minimal
+    try {
+      const lead = await prisma.lead.create({
+        data: {
           tenantId,
-          parts: ["leads", lead.id, "card"],
-          filename: `${unique}-${filename}`,
-        });
+          formId: body.formId,
+          clientLeadId: body.clientLeadId,
+          capturedByDeviceUid: body.capturedByDeviceUid,
+          data: dataJson,
+          meta: body.meta,
+        } as any,
+        select: { id: true },
+      });
+      leadId = lead.id;
+    } catch {
+      const lead = await prisma.lead.create({
+        data: {
+          tenantId,
+          formId: body.formId,
+          data: dataJson,
+        } as any,
+        select: { id: true },
+      });
+      leadId = lead.id;
+    }
 
-        const absPath = resolveUnderRoot(UPLOADS_ROOT_ABS, storageKey);
-        await writeFileAtomic(absPath, bytes);
+    // accept both naming schemes
+    const cardBase64 = body.cardImageBase64 ?? body.cardBase64 ?? body.card?.base64;
+    const cardMimeType =
+      body.cardImageMimeType ?? body.cardMimeType ?? body.card?.mimeType ?? "image/jpeg";
+    const originalName =
+      body.cardImageFilename ?? body.cardFilename ?? body.card?.filename;
 
-        await prisma.leadAttachment.create({
-          data: {
+    // attachment best-effort
+    if (cardBase64) {
+      try {
+        const bytes = decodeBase64(cardBase64);
+        if (bytes.byteLength > 0) {
+          const ext = inferExt(cardMimeType);
+          const safeName = sanitizeFilename(originalName ?? `card.${ext}`);
+          const filename = safeName.includes(".") ? safeName : `${safeName}.${ext}`;
+
+          const unique = `${Date.now()}-${crypto.randomUUID()}`;
+          const storageKey = buildUploadsKey({
             tenantId,
-            leadId: lead.id,
-            filename,
-            mimeType: cardMimeType,
-            storageKey,
-          } as any,
-          select: { id: true },
-        });
+            parts: ["leads", leadId, "card"],
+            filename: `${unique}-${filename}`,
+          });
+
+          const absPath = resolveUnderRoot(UPLOADS_ROOT_ABS, storageKey);
+          await writeFileAtomic(absPath, bytes);
+
+          await prisma.leadAttachment.create({
+            data: {
+              tenantId,
+              leadId,
+              filename,
+              mimeType: cardMimeType,
+              storageKey,
+            } as any,
+            select: { id: true },
+          });
+        }
+      } catch {
+        // ignore attachment errors
       }
     }
 
-    return jsonOk(req, { id: lead.id });
+    return jsonOk(req, { id: leadId });
   } catch (err: any) {
     if (err instanceof HttpError) {
       return jsonError(req, err.status, err.code, err.message);
