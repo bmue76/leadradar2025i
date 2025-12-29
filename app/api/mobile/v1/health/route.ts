@@ -1,27 +1,39 @@
-import type { NextRequest } from "next/server";
-import { jsonError, jsonOk } from "@/lib/api";
+// app/api/mobile/v1/health/route.ts
+import { NextRequest, NextResponse } from "next/server";
 
-export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+
+function getTraceId(req: NextRequest) {
+  const incoming = req.headers.get("x-trace-id")?.trim();
+  return incoming && incoming.length <= 128 ? incoming : cryptoRandom();
+}
+
+function cryptoRandom() {
+  // Node.js runtime → crypto.randomUUID ist verfügbar
+  // Fallback: Timestamp + random
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c: any = globalThis.crypto as any;
+  if (c?.randomUUID) return c.randomUUID();
+  return `t_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function jsonOk(traceId: string, data: unknown, status = 200) {
+  const res = NextResponse.json({ ok: true, data, traceId }, { status });
+  res.headers.set("x-trace-id", traceId);
+  return res;
+}
 
 export async function GET(req: NextRequest) {
-  if (!process.env.DATABASE_URL) {
-    return jsonError(
-      req,
-      500,
-      "CONFIG_MISSING",
-      "Missing required env var: DATABASE_URL",
-      { missing: ["DATABASE_URL"] }
-    );
-  }
+  const traceId = getTraceId(req);
+  return jsonOk(traceId, {
+    status: "ok",
+    now: new Date().toISOString(),
+  });
+}
 
-  const data = {
-    status: "ok" as const,
-    scope: "mobile" as const,
-    nowIso: new Date().toISOString(),
-    nodeEnv: process.env.NODE_ENV ?? null,
-    vercelRegion: process.env.VERCEL_REGION ?? null,
-    vercelId: req.headers.get("x-vercel-id") ?? null,
-  };
-
-  return jsonOk(req, data);
+export async function HEAD(req: NextRequest) {
+  const traceId = getTraceId(req);
+  const res = new NextResponse(null, { status: 200 });
+  res.headers.set("x-trace-id", traceId);
+  return res;
 }
