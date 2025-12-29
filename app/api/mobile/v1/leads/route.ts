@@ -6,12 +6,6 @@ import { PrismaClient } from "@prisma/client";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/**
- * Standard response shape:
- *   { ok:true, data, traceId } oder { ok:false, error:{code,message,details?}, traceId }
- * plus header: x-trace-id
- */
-
 declare global {
   // eslint-disable-next-line no-var
   var __prismaLR: PrismaClient | undefined;
@@ -42,7 +36,6 @@ function getTraceId(req: NextRequest) {
   const incoming = req.headers.get("x-trace-id")?.trim();
   if (incoming && incoming.length <= 128) return incoming;
 
-  // Node runtime: crypto.randomUUID verfügbar
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const c: any = (globalThis as any).crypto;
   if (c?.randomUUID) return c.randomUUID();
@@ -90,7 +83,6 @@ const LeadPostSchema = z
     formId: z.string().min(3).max(128),
     values: JsonRecord.default({}),
 
-    // optional kompatibilität/erweiterung
     eventId: z.string().min(3).max(128).optional(),
     cardImageBase64: z.string().optional(),
     ocrMeta: z.unknown().optional(),
@@ -136,21 +128,21 @@ function devDetails(e: unknown) {
   };
 }
 
-function pickEnumValue(enumName: string, preferred: string[]) {
+function getDmmfModels() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const dmmf: any = (prisma as any)._dmmf;
-  const enums = dmmf?.datamodel?.enums ?? [];
-  const en = enums.find((x: any) => x.name === enumName);
-  const values: string[] = (en?.values ?? []).map((v: any) => v.name);
+  return (dmmf?.datamodel?.models ?? []) as any[];
+}
 
-  for (const p of preferred) if (values.includes(p)) return p;
-  return values[0] ?? undefined;
+function hasModelField(modelName: string, fieldName: string) {
+  const models = getDmmfModels();
+  const m = models.find((x) => x.name === modelName);
+  if (!m) return false;
+  return (m.fields ?? []).some((f: any) => f.name === fieldName);
 }
 
 function getLeadModel() {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const dmmf: any = (prisma as any)._dmmf;
-  const models = dmmf?.datamodel?.models ?? [];
+  const models = getDmmfModels();
   return models.find((m: any) => m.name === "Lead");
 }
 
@@ -171,6 +163,17 @@ function requiredScalarFieldsWithoutDefault(): ScalarField[] {
     .filter((f) => f.kind === "scalar")
     .map((f) => f as ScalarField)
     .filter((f) => f.isRequired && !f.hasDefaultValue && !f.isId);
+}
+
+function pickEnumValue(enumName: string, preferred: string[]) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dmmf: any = (prisma as any)._dmmf;
+  const enums = dmmf?.datamodel?.enums ?? [];
+  const en = enums.find((x: any) => x.name === enumName);
+  const values: string[] = (en?.values ?? []).map((v: any) => v.name);
+
+  for (const p of preferred) if (values.includes(p)) return p;
+  return values[0] ?? undefined;
 }
 
 export async function POST(req: NextRequest) {
@@ -221,9 +224,13 @@ export async function POST(req: NextRequest) {
       return jsonError(traceId, { code: "TENANT_INVALID", message: `Unknown tenant slug: ${tenantSlug}` }, 401);
     }
 
+    // ✅ schema-safe Form select
+    const formSelect: any = { id: true, status: true };
+    if (hasModelField("Form", "eventId")) formSelect.eventId = true;
+
     const form = await (prisma as any).form.findFirst({
       where: { id: body.formId, tenantId: tenant.id },
-      select: { id: true, status: true, eventId: true },
+      select: formSelect,
     });
 
     if (!form) {
@@ -270,8 +277,9 @@ export async function POST(req: NextRequest) {
     const required = requiredScalarFieldsWithoutDefault();
     const requiredNames = new Set(required.map((f) => f.name));
 
+    // eventId nur wenn Lead es wirklich REQUIRED hat (sonst ignorieren)
     if (requiredNames.has("eventId")) {
-      const ev = (body as any).eventId ?? form.eventId;
+      const ev = (body as any).eventId ?? (form as any).eventId;
       if (!ev) {
         return jsonError(
           traceId,
