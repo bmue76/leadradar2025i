@@ -624,13 +624,13 @@ export default function CaptureScreen() {
       const res =
         source === "camera"
           ? await ImagePicker.launchCameraAsync({
-              mediaTypes: ImagePicker.MediaTypeOptions.Images,
+              mediaTypes: ImagePicker.MediaType.Images,
               quality: 0.35,
               allowsEditing: false,
               exif: false,
             })
           : await ImagePicker.launchImageLibraryAsync({
-              mediaTypes: ImagePicker.MediaTypeOptions.Images,
+              mediaTypes: ImagePicker.MediaType.Images,
               quality: 0.35,
               allowsEditing: false,
               exif: false,
