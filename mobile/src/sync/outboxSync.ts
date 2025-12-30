@@ -62,9 +62,29 @@ function stripDataPrefix(b64: string): string {
   return s;
 }
 
+function getServerCode(e: any): string | undefined {
+  // If mobileApi throws parsed jsonError: { ok:false, error:{code,message,details}, traceId }
+  if (e && typeof e === "object" && e.ok === false && e.error && typeof e.error === "object") {
+    if (typeof e.error.code === "string") return e.error.code;
+  }
+  // Some libs wrap as e.data / e.body
+  if (e?.data?.error?.code && typeof e.data.error.code === "string") return e.data.error.code;
+  if (e?.body?.error?.code && typeof e.body.error.code === "string") return e.body.error.code;
+  return undefined;
+}
+
+function getServerMessage(e: any): string | undefined {
+  if (e && typeof e === "object" && e.ok === false && e.error && typeof e.error === "object") {
+    if (typeof e.error.message === "string") return e.error.message;
+  }
+  if (typeof e?.message === "string") return e.message;
+  return undefined;
+}
+
 function toOutboxError(e: any, fallbackMessage: string, code?: string): OutboxError {
-  const msg = e?.message ? String(e.message) : fallbackMessage;
-  return { code, message: msg, at: nowIso() };
+  const serverCode = getServerCode(e);
+  const msg = getServerMessage(e) || fallbackMessage;
+  return { code: code ?? serverCode, message: String(msg), at: nowIso() };
 }
 
 function firstLegacyAttachment(item: OutboxItem): PendingAttachment | null {
@@ -97,7 +117,6 @@ async function deleteLocalFile(uri: string) {
 }
 
 async function readBase64FromUri(uri: string): Promise<string> {
-  // Expo SDK typings differ → use string literal (TS-safe)
   const b64 = await FileSystem.readAsStringAsync(uri, { encoding: "base64" as any } as any);
   return stripDataPrefix(String(b64 || ""));
 }
@@ -107,16 +126,15 @@ async function setItemState(id: string, patch: Partial<OutboxItem> & { status?: 
 }
 
 function shouldRetryWithoutMeta(e: any): boolean {
-  const msg = String(e?.message ?? "").toLowerCase();
-  // Heuristic: backend might reject unknown key "meta" (zod/validation)
+  // If backend rejects payload validation, retry once without meta.
+  const code = getServerCode(e);
+  if (code === "VALIDATION_FAILED" || code === "PRISMA_VALIDATION") return true;
+
+  // fallback heuristic
+  const msg = String(getServerMessage(e) ?? "").toLowerCase();
+  if (!msg) return false;
   if (!msg.includes("meta")) return false;
-  return (
-    msg.includes("unrecognized") ||
-    msg.includes("unknown") ||
-    msg.includes("unexpected") ||
-    msg.includes("invalid") ||
-    msg.includes("zod")
-  );
+  return msg.includes("unrecognized") || msg.includes("unknown") || msg.includes("unexpected") || msg.includes("invalid") || msg.includes("zod");
 }
 
 async function postLeadWithOptionalMetaFallback(args: {
@@ -137,7 +155,6 @@ async function postLeadWithOptionalMetaFallback(args: {
     });
     return { usedMeta: !!args.body?.meta };
   } catch (e: any) {
-    // if we sent meta and backend rejects it → retry without meta (best-effort)
     if (args.body?.meta && shouldRetryWithoutMeta(e)) {
       const body2 = { ...args.body };
       delete body2.meta;
@@ -183,8 +200,6 @@ async function syncOneInternal(args: {
   try {
     // Preferred: inline card base64 (new flow)
     let cardImageBase64 = stripDataPrefix(item.cardImageBase64 || "");
-    let cardImageMimeType = String(item.cardImageMimeType || "image/jpeg");
-    let cardImageFilename = String(item.cardImageFilename || "businesscard.jpg");
 
     // Legacy fallback: attachments[] -> read file base64 and send inline
     const legacyAtt = !cardImageBase64 ? firstLegacyAttachment(item) : null;
@@ -195,12 +210,7 @@ async function syncOneInternal(args: {
 
         const nextAttachments = (item.attachments ?? []).map((a) =>
           a.id === legacyAtt.id
-            ? {
-                ...a,
-                status: "FAILED" as const,
-                tries: (a.tries ?? 0) + 1,
-                lastError: err.message,
-              }
+            ? { ...a, status: "FAILED" as const, tries: (a.tries ?? 0) + 1, lastError: err.message }
             : a
         );
 
@@ -215,25 +225,17 @@ async function syncOneInternal(args: {
       }
 
       cardImageBase64 = await readBase64FromUri(legacyAtt.localUri);
-      cardImageMimeType = legacyAtt.mimeType || cardImageMimeType;
-      cardImageFilename = legacyAtt.filename || cardImageFilename;
     }
 
+    // IMPORTANT: send only schema-safe fields
     const leadBody: any = {
       formId: item.formId,
       clientLeadId: item.clientLeadId,
-      values: item.values,
-      capturedByDeviceUid: item.capturedByDeviceUid,
-
-      ...(cardImageBase64
-        ? {
-            cardImageBase64,
-            cardImageMimeType,
-            cardImageFilename,
-          }
-        : {}),
+      values: item.values ?? {},
+      ...(cardImageBase64 ? { cardImageBase64 } : {}),
     };
 
+    // meta optional (backend may reject -> fallback will retry without)
     if (item.meta && typeof item.meta === "object") {
       leadBody.meta = item.meta;
     }
@@ -245,7 +247,6 @@ async function syncOneInternal(args: {
       body: leadBody,
     });
 
-    // cleanup legacy local file if we used it
     if (legacyAtt?.localUri) {
       await deleteLocalFile(legacyAtt.localUri);
     }
@@ -257,18 +258,12 @@ async function syncOneInternal(args: {
   } catch (e: any) {
     const err = toOutboxError(e, "Sync failed");
 
-    // mark legacy attachment as FAILED (keep queued)
     const legacyAtt = firstLegacyAttachment(item);
     let nextAttachments = item.attachments;
     if (legacyAtt && Array.isArray(item.attachments)) {
       nextAttachments = item.attachments.map((a) =>
         a.id === legacyAtt.id
-          ? {
-              ...a,
-              status: "FAILED" as const,
-              tries: (a.tries ?? 0) + 1,
-              lastError: err.message,
-            }
+          ? { ...a, status: "FAILED" as const, tries: (a.tries ?? 0) + 1, lastError: err.message }
           : a
       );
     }
@@ -284,17 +279,12 @@ async function syncOneInternal(args: {
   }
 }
 
-/**
- * Single entry-point for manual + auto sync.
- * - Mutex prevents parallel runs (manual + auto)
- * - Never throws for per-item failures; returns summary
- */
 export async function syncOutboxNow(args: {
   baseUrl?: string;
   tenantSlug?: string;
-  reason?: string; // "manual" | "start" | "foreground" | "online" | "retry:*"
+  reason?: string;
   isOnline?: boolean;
-  timeoutMs?: number; // default 8000
+  timeoutMs?: number;
 }): Promise<OutboxSyncSummary> {
   const reason = args.reason ?? "manual";
   const timeoutMs = args.timeoutMs ?? 8000;
@@ -349,13 +339,7 @@ export async function syncOutboxNow(args: {
 
     const finishedAt = nowIso();
     emitStatus({ syncing: false, reason, startedAt, finishedAt, ok, failed, skipped });
-    return {
-      ok,
-      failed,
-      skipped,
-      message: `Sync finished: ok=${ok}, failed=${failed}, skipped=${skipped}`,
-      finishedAt,
-    };
+    return { ok, failed, skipped, message: `Sync finished: ok=${ok}, failed=${failed}, skipped=${skipped}`, finishedAt };
   } catch (e: any) {
     const finishedAt = nowIso();
     const msg = e?.message ? String(e.message) : "Sync error";
@@ -366,14 +350,11 @@ export async function syncOutboxNow(args: {
   }
 }
 
-/**
- * Single-item sync (Retry one item). Uses same mutex as syncOutboxNow().
- */
 export async function syncOutboxOne(args: {
   itemId: string;
   baseUrl?: string;
   tenantSlug?: string;
-  reason?: string; // "retry:<id>"
+  reason?: string;
   isOnline?: boolean;
   timeoutMs?: number;
 }): Promise<OutboxSyncSummary> {
