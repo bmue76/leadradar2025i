@@ -14,6 +14,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRoute } from "@react-navigation/native";
 import type { RouteProp } from "@react-navigation/native";
+import { useNetInfo } from "@react-native-community/netinfo";
 
 import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
@@ -130,15 +131,11 @@ async function deleteLocalFile(uri: string) {
 }
 
 function getBase64EncodingValue() {
-  // Expo SDK / typings differ: EncodingType might not exist in TS,
-  // but runtime may still provide it. Fallback to string literal.
   return ((FileSystem as any).EncodingType?.Base64 ?? "base64") as any;
 }
 
 async function readBase64FromUri(uri: string): Promise<string> {
-  const b64 = await FileSystem.readAsStringAsync(uri, {
-    encoding: getBase64EncodingValue(),
-  } as any);
+  const b64 = await FileSystem.readAsStringAsync(uri, { encoding: getBase64EncodingValue() } as any);
   return String(b64 || "");
 }
 
@@ -154,11 +151,235 @@ function isStringishFieldType(t: FieldType) {
   return t === "TEXT" || t === "TEXTAREA" || t === "EMAIL" || t === "PHONE" || t === "URL" || t === "NUMBER";
 }
 
+function stripDataPrefix(b64: string): string {
+  const s = String(b64 || "").trim();
+  if (!s) return "";
+  if (s.startsWith("data:")) {
+    const idx = s.indexOf(",");
+    if (idx >= 0) return s.slice(idx + 1);
+  }
+  return s;
+}
+
+function getHttpStatusFromError(e: any): number | undefined {
+  const candidates = [
+    e?.status,
+    e?.statusCode,
+    e?.response?.status,
+    e?.res?.status,
+    e?.httpStatus,
+    e?.data?.status,
+    e?.data?.error?.status,
+    e?.body?.status,
+    e?.body?.error?.status,
+  ]
+    .map((x) => (typeof x === "number" ? x : undefined))
+    .filter((x) => typeof x === "number") as number[];
+
+  if (candidates.length) return candidates[0];
+
+  const msg = String(e?.message ?? "");
+  const m = msg.match(/\b(4\d{2}|5\d{2})\b/);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n)) return n;
+  }
+
+  return undefined;
+}
+
+function getApiCodeFromError(e: any): string | undefined {
+  return (
+    (typeof e?.error?.code === "string" && e.error.code) ||
+    (typeof e?.data?.error?.code === "string" && e.data.error.code) ||
+    (typeof e?.body?.error?.code === "string" && e.body.error.code) ||
+    (typeof e?.code === "string" && e.code) ||
+    undefined
+  );
+}
+
+function getApiMessageFromError(e: any): string {
+  return (
+    (typeof e?.error?.message === "string" && e.error.message) ||
+    (typeof e?.data?.error?.message === "string" && e.data.error.message) ||
+    (typeof e?.body?.error?.message === "string" && e.body.error.message) ||
+    (typeof e?.message === "string" && e.message) ||
+    "Unknown error"
+  );
+}
+
+function shouldRetryWithoutMeta(e: any): boolean {
+  const msg = String(getApiMessageFromError(e) ?? "").toLowerCase();
+  if (!msg.includes("meta")) return false;
+  return (
+    msg.includes("unrecognized") ||
+    msg.includes("unknown") ||
+    msg.includes("unexpected") ||
+    msg.includes("invalid") ||
+    msg.includes("zod")
+  );
+}
+
+function isTransientNetworkLikeError(e: any): boolean {
+  const msg = String(getApiMessageFromError(e) ?? "").toLowerCase();
+  if (
+    msg.includes("network request failed") ||
+    msg.includes("failed to fetch") ||
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("econnreset") ||
+    msg.includes("econnrefused") ||
+    msg.includes("enotfound")
+  ) {
+    return true;
+  }
+  const status = getHttpStatusFromError(e);
+  if (typeof status === "number" && status >= 500) return true;
+  return false;
+}
+
+// Outbox nur offline/transient, NICHT bei 4xx (422 etc)
+function shouldQueueOnSaveError(args: { e: any; networkOnline: boolean | null; hasBaseUrl: boolean }): boolean {
+  const { e, networkOnline, hasBaseUrl } = args;
+
+  if (!hasBaseUrl) return true;
+  if (networkOnline === false) return true;
+
+  const status = getHttpStatusFromError(e);
+  const apiCode = getApiCodeFromError(e);
+
+  if (apiCode === "VALIDATION_FAILED") return false;
+  if (typeof status === "number" && status >= 400 && status < 500) return false;
+
+  return isTransientNetworkLikeError(e);
+}
+
+async function createLeadOnline(args: {
+  baseUrl: string;
+  tenantSlug: string;
+  formId: string;
+  clientLeadId: string;
+  values: any;
+  meta?: any;
+}): Promise<{ leadId: string; created?: boolean; usedMeta: boolean }> {
+  const { baseUrl, tenantSlug, formId, clientLeadId, values, meta } = args;
+
+  // Candidate bodies (progressive hardening)
+  const candidates: Array<{ body: any; usedMeta: boolean }> = [];
+
+  // 1) with meta (if present)
+  if (meta && typeof meta === "object") {
+    candidates.push({
+      body: { formId, clientLeadId, values, meta },
+      usedMeta: true,
+    });
+  }
+
+  // 2) without meta (always)
+  candidates.push({
+    body: { formId, clientLeadId, values },
+    usedMeta: false,
+  });
+
+  let lastErr: any = null;
+
+  for (const c of candidates) {
+    try {
+      const raw = await mobilePostJson({
+        baseUrl,
+        tenantSlug,
+        path: "/api/mobile/v1/leads",
+        timeoutMs: 15000,
+        body: c.body,
+      });
+
+      const payload = unwrapPayload(raw);
+      const leadId = String((payload as any)?.id ?? "");
+      const created = (payload as any)?.created;
+
+      if (!leadId) {
+        throw new Error("Lead created but response missing id.");
+      }
+
+      return { leadId, created, usedMeta: c.usedMeta };
+    } catch (e: any) {
+      lastErr = e;
+
+      // If meta rejected, retry without meta even if status isn't cleanly detectable
+      if (c.usedMeta && shouldRetryWithoutMeta(e)) {
+        continue;
+      }
+
+      // If this candidate fails with 4xx validation, try next (schema might not accept meta)
+      const status = getHttpStatusFromError(e);
+      if (typeof status === "number" && status >= 400 && status < 500) {
+        continue;
+      }
+
+      // Non-4xx: stop early
+      throw e;
+    }
+  }
+
+  throw lastErr ?? new Error("Create lead failed.");
+}
+
+async function uploadBusinessCardAttachmentOnline(args: {
+  baseUrl: string;
+  tenantSlug: string;
+  leadId: string;
+  filename: string;
+  mimeType: string;
+  base64: string;
+}): Promise<void> {
+  const { baseUrl, tenantSlug, leadId, filename, mimeType } = args;
+  const b64 = stripDataPrefix(args.base64);
+
+  // try a few common schemas (backend typings may differ)
+  const common = { filename, mimeType, kind: "BUSINESS_CARD" };
+  const candidates: any[] = [
+    { ...common, base64: b64 },
+    { ...common, fileBase64: b64 },
+    { ...common, contentBase64: b64 },
+    { ...common, dataBase64: b64 },
+    { ...common, file: { filename, mimeType, base64: b64 } },
+  ];
+
+  let lastErr: any = null;
+
+  for (const body of candidates) {
+    try {
+      await mobilePostJson({
+        baseUrl,
+        tenantSlug,
+        path: `/api/mobile/v1/leads/${encodeURIComponent(leadId)}/attachments`,
+        timeoutMs: 20000,
+        body,
+      });
+      return;
+    } catch (e: any) {
+      lastErr = e;
+      const status = getHttpStatusFromError(e);
+      // try next only for 4xx schema mismatch
+      if (typeof status === "number" && status >= 400 && status < 500) continue;
+
+      // if we cannot parse status but message suggests validation, also continue
+      const msg = String(getApiMessageFromError(e) ?? "").toLowerCase();
+      if (msg.includes("validation") || msg.includes("invalid input") || msg.includes("unprocessable")) continue;
+
+      throw e;
+    }
+  }
+
+  throw lastErr ?? new Error("Attachment upload failed.");
+}
+
 export default function CaptureScreen() {
   const route = useRoute<R>();
   const { formId, formName } = route.params;
 
   const { isLoaded, baseUrl, tenantSlug, deviceUid } = useSettings();
+  const netInfo = useNetInfo();
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -172,6 +393,9 @@ export default function CaptureScreen() {
   const [card, setCard] = useState<PendingCard | null>(null);
   const [cardBusy, setCardBusy] = useState(false);
 
+  // Keep same clientLeadId on retry to avoid duplicates (idempotent)
+  const [pendingClientLeadId, setPendingClientLeadId] = useState<string | null>(null);
+
   // OCR
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrError, setOcrError] = useState<string | null>(null);
@@ -182,6 +406,14 @@ export default function CaptureScreen() {
   const [showOcrRaw, setShowOcrRaw] = useState(false);
 
   const canLoad = useMemo(() => isLoaded && !!tenantSlug && !!formId, [isLoaded, tenantSlug, formId]);
+
+  // tri-state online
+  const networkOnline: boolean | null = useMemo(() => {
+    if (netInfo.isInternetReachable === false) return false;
+    if (netInfo.isConnected === false) return false;
+    if (netInfo.isConnected === true) return true;
+    return null;
+  }, [netInfo.isConnected, netInfo.isInternetReachable]);
 
   const fields = useMemo(() => {
     const list = form?.fields ?? [];
@@ -326,7 +558,6 @@ export default function CaptureScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canLoad, baseUrl, tenantSlug, formId]);
 
-  // When card changes, OCR should be reset (avoid applying OCR from an old image)
   useEffect(() => {
     setOcrError(null);
     setOcrInfo(null);
@@ -424,7 +655,7 @@ export default function CaptureScreen() {
       }
 
       const filename = ensureJpgName(asset.fileName || basenameFromUri(finalUri) || "businesscard.jpg");
-      const base64 = await readBase64FromUri(finalUri);
+      const base64 = stripDataPrefix(await readBase64FromUri(finalUri));
 
       if (finalUri && finalUri !== asset.uri) {
         await deleteLocalFile(finalUri);
@@ -439,7 +670,10 @@ export default function CaptureScreen() {
         base64,
       });
 
-      setInfo("Visitenkarte bereit (Base64). Wird beim Speichern mitgesendet. ✅");
+      // new capture -> new idempotency id
+      setPendingClientLeadId(null);
+
+      setInfo("Visitenkarte bereit (Base64). ✅");
     } catch (e: any) {
       setError(e?.message ? String(e.message) : "Visitenkarte konnte nicht erfasst werden.");
     } finally {
@@ -449,19 +683,14 @@ export default function CaptureScreen() {
 
   async function removeCard() {
     setCard(null);
+    setPendingClientLeadId(null);
   }
 
   async function writeTempJpgFromBase64(base64: string): Promise<string> {
     const safeRand = Math.random().toString(16).slice(2);
     const uri = `${FileSystem.cacheDirectory ?? ""}ocr_${Date.now()}_${safeRand}.jpg`;
     if (!uri) throw new Error("No cacheDirectory available to write temp OCR file.");
-    await FileSystem.writeAsStringAsync(
-      uri,
-      base64,
-      {
-        encoding: getBase64EncodingValue(),
-      } as any
-    );
+    await FileSystem.writeAsStringAsync(uri, base64, { encoding: getBase64EncodingValue() } as any);
     return uri;
   }
 
@@ -529,7 +758,7 @@ export default function CaptureScreen() {
 
       setOcrMeta(meta);
       setOcrApply(nextApply);
-      setOcrInfo("OCR fertig. Bitte Vorschläge prüfen und bei Bedarf übernehmen. ✅");
+      setOcrInfo("OCR fertig. ✅");
     } catch (e: any) {
       const msg = e?.message ? String(e.message) : "OCR fehlgeschlagen.";
       setOcrError(msg);
@@ -583,12 +812,10 @@ export default function CaptureScreen() {
 
         const target = pickTargetField(kind);
         if (!target) continue;
-
         if (!isStringishFieldType(target.type)) continue;
 
         const k = fieldKey(target);
         const cur = typeof next[k] === "string" ? String(next[k]).trim() : "";
-
         if (!ocrOverwrite && cur) continue;
 
         next[k] = val;
@@ -597,7 +824,7 @@ export default function CaptureScreen() {
       return next;
     });
 
-    setOcrInfo("Vorschläge übernommen (best-effort). ✍️");
+    setOcrInfo("Vorschläge übernommen. ✍️");
   }
 
   async function onSaveLead() {
@@ -622,59 +849,103 @@ export default function CaptureScreen() {
     setError(null);
     setInfo(null);
 
-    const clientLeadId = await uuidv4();
+    const clientLeadId = pendingClientLeadId ?? (await uuidv4());
+    if (!pendingClientLeadId) setPendingClientLeadId(clientLeadId);
 
-    const body: any = {
-      formId: form.id,
-      clientLeadId,
-      values,
-      capturedByDeviceUid: deviceUid,
-      cardImageBase64: card.base64,
-      cardImageMimeType: card.mimeType,
-      cardImageFilename: card.filename,
-    };
+    const meta = ocrMeta ? { ocr: ocrMeta } : undefined;
 
-    if (ocrMeta) {
-      body.meta = { ...(body.meta ?? {}), ocr: ocrMeta };
+    // OFFLINE => Outbox
+    if (!baseUrl || networkOnline === false) {
+      try {
+        await enqueueOutbox({
+          id: await uuidv4(),
+          createdAt: new Date().toISOString(),
+          formId: form.id,
+          clientLeadId,
+          capturedByDeviceUid: deviceUid,
+          values,
+          meta,
+          tries: 0,
+          lastError: !baseUrl ? "No baseUrl (offline)" : "Offline (netInfo)",
+          cardImageBase64: stripDataPrefix(card.base64),
+          cardImageMimeType: card.mimeType,
+          cardImageFilename: card.filename,
+        });
+
+        setInfo("Offline → Lead + Visitenkarte in Outbox. ⏳");
+        resetValues();
+        setCard(null);
+        setPendingClientLeadId(null);
+      } finally {
+        setSaving(false);
+      }
+      return;
     }
 
     try {
-      if (!baseUrl) throw new Error("No baseUrl");
-
-      await mobilePostJson({
-        baseUrl,
+      // 1) Create lead (minimal schema-safe; NO card inline)
+      const created = await createLeadOnline({
+        baseUrl: baseUrl!,
         tenantSlug,
-        path: "/api/mobile/v1/leads",
-        timeoutMs: 15000,
-        body,
-      });
-
-      setInfo("Lead + Visitenkarte gespeichert. ✅");
-      resetValues();
-      setCard(null);
-    } catch (e: any) {
-      const msg = e?.message ? String(e.message) : "Save failed, queued.";
-
-      await enqueueOutbox({
-        id: await uuidv4(),
-        createdAt: new Date().toISOString(),
         formId: form.id,
         clientLeadId,
-        capturedByDeviceUid: deviceUid,
         values,
-
-        meta: ocrMeta ? { ocr: ocrMeta } : undefined,
-
-        tries: 0,
-        lastError: msg,
-        cardImageBase64: card.base64,
-        cardImageMimeType: card.mimeType,
-        cardImageFilename: card.filename,
+        meta, // optional, with fallback
       });
 
-      setInfo("Offline/failed → Lead + Visitenkarte in Outbox. ⏳");
+      // 2) Upload business card as attachment (schema fallbacks)
+      await uploadBusinessCardAttachmentOnline({
+        baseUrl: baseUrl!,
+        tenantSlug,
+        leadId: created.leadId,
+        filename: card.filename,
+        mimeType: card.mimeType,
+        base64: card.base64,
+      });
+
+      setInfo(created.usedMeta ? "Lead + Visitenkarte gespeichert. ✅" : "Lead gespeichert (meta übersprungen) + Visitenkarte ✅");
       resetValues();
       setCard(null);
+      setPendingClientLeadId(null);
+    } catch (e: any) {
+      const queue = shouldQueueOnSaveError({ e, networkOnline, hasBaseUrl: !!baseUrl });
+
+      if (queue) {
+        const msg = getApiMessageFromError(e);
+
+        await enqueueOutbox({
+          id: await uuidv4(),
+          createdAt: new Date().toISOString(),
+          formId: form.id,
+          clientLeadId,
+          capturedByDeviceUid: deviceUid,
+          values,
+          meta,
+          tries: 0,
+          lastError: msg,
+          cardImageBase64: stripDataPrefix(card.base64),
+          cardImageMimeType: card.mimeType,
+          cardImageFilename: card.filename,
+        });
+
+        setInfo("Temporär fehlgeschlagen → Lead in Outbox. ⏳");
+        resetValues();
+        setCard(null);
+        setPendingClientLeadId(null);
+        setError(null);
+      } else {
+        // Do NOT queue. Keep values + card; keep clientLeadId for safe retry.
+        const status = getHttpStatusFromError(e);
+        const apiCode = getApiCodeFromError(e);
+        const msg = getApiMessageFromError(e);
+
+        const extra = [apiCode ? `code=${apiCode}` : null, typeof status === "number" ? `http=${status}` : null]
+          .filter(Boolean)
+          .join(", ");
+
+        setError(extra ? `${msg} (${extra})` : msg);
+        setInfo("Nicht gespeichert (kein Offline-Fall). Bitte korrigieren und erneut speichern.");
+      }
     } finally {
       setSaving(false);
     }
@@ -868,8 +1139,8 @@ export default function CaptureScreen() {
                 <View style={styles.cardBox}>
                   <Text style={styles.cardTitle}>Visitenkarte (Scan)</Text>
                   <Text style={styles.cardText}>
-                    Prozess: Bei jedem Lead wird ein Visitenkarten-Abbild mitgesendet (MVP: komprimiertes JPG als Base64
-                    im Lead-Create).
+                    Online: Lead wird zuerst minimal erstellt, danach wird die Visitenkarte als Attachment hochgeladen.
+                    Offline: Outbox.
                   </Text>
 
                   {card ? (
@@ -879,9 +1150,6 @@ export default function CaptureScreen() {
                       </Text>
                       <Text style={styles.cardMeta}>
                         Zeitpunkt: <Text style={styles.mono}>{card.createdAt}</Text>
-                      </Text>
-                      <Text style={styles.cardMeta}>
-                        Status: <Text style={styles.mono}>bereit</Text>
                       </Text>
 
                       <View style={styles.actionsRow}>
@@ -984,9 +1252,7 @@ export default function CaptureScreen() {
 
                 <View style={styles.footerCard}>
                   <Text style={styles.footerTitle}>Save Lead</Text>
-                  <Text style={styles.footerText}>
-                    Online: JSON Lead + cardImageBase64 (+ optional meta.ocr). Offline/fail: queued to Outbox (inkl. Base64).
-                  </Text>
+                  <Text style={styles.footerText}>Online: Create Lead (minimal) + Upload Card (Attachment). Outbox: nur Offline/Transient.</Text>
 
                   <Pressable
                     style={[styles.btnPrimary, (saving || !card) ? { opacity: 0.6 } : null]}
