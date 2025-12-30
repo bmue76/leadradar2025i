@@ -176,6 +176,12 @@ function pickEnumValue(enumName: string, preferred: string[]) {
   return values[0] ?? undefined;
 }
 
+// ✅ In deinem System ist "published" offenbar ACTIVE (und ggf. ONLINE in neueren Ständen).
+function isFormOnlineStatus(status: unknown) {
+  const s = String(status ?? "").toUpperCase();
+  return s === "ONLINE" || s === "ACTIVE";
+}
+
 export async function POST(req: NextRequest) {
   const traceId = getTraceId(req);
 
@@ -224,7 +230,7 @@ export async function POST(req: NextRequest) {
       return jsonError(traceId, { code: "TENANT_INVALID", message: `Unknown tenant slug: ${tenantSlug}` }, 401);
     }
 
-    // ✅ schema-safe Form select
+    // schema-safe Form select
     const formSelect: any = { id: true, status: true };
     if (hasModelField("Form", "eventId")) formSelect.eventId = true;
 
@@ -241,14 +247,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (form.status !== "ONLINE") {
+    // ✅ accept ACTIVE as online
+    if (!isFormOnlineStatus(form.status)) {
       return jsonError(
         traceId,
-        { code: "FORM_NOT_ONLINE", message: "Form is not ONLINE.", details: { status: form.status } },
+        {
+          code: "FORM_NOT_ONLINE",
+          message: "Form is not ONLINE.",
+          details: { status: form.status, accepted: ["ONLINE", "ACTIVE"] },
+        },
         409
       );
     }
 
+    // Idempotency by (tenantId, clientLeadId)
     const existing = await prisma.lead.findFirst({
       where: { tenantId: tenant.id, clientLeadId: body.clientLeadId },
       select: { id: true },
@@ -277,7 +289,6 @@ export async function POST(req: NextRequest) {
     const required = requiredScalarFieldsWithoutDefault();
     const requiredNames = new Set(required.map((f) => f.name));
 
-    // eventId nur wenn Lead es wirklich REQUIRED hat (sonst ignorieren)
     if (requiredNames.has("eventId")) {
       const ev = (body as any).eventId ?? (form as any).eventId;
       if (!ev) {
